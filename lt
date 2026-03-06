@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+BASE_URL="https://app.litetracker.com/services/v5"
+CONFIG_DIR="$HOME/.lt"
+TOKEN_FILE="$CONFIG_DIR/api_token"
+
+# --- Helpers ---
+
+die() {
+  echo "Error: $1" >&2
+  exit 1
+}
+
+check_deps() {
+  command -v curl >/dev/null 2>&1 || die "curl is required. Install it with: sudo apt install curl"
+  command -v jq >/dev/null 2>&1 || die "jq is required. Install it with: sudo apt install jq"
+}
+
+load_token() {
+  [[ -f "$TOKEN_FILE" ]] || die "Not authenticated. Run 'lt auth' first."
+  TOKEN=$(<"$TOKEN_FILE")
+  [[ -n "$TOKEN" ]] || die "API token is empty. Run 'lt auth' to reconfigure."
+}
+
+api_get() {
+  local response http_code body
+  response=$(curl -sS -w "\n%{http_code}" -H "X-TrackerToken: $TOKEN" "$BASE_URL$1")
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+  if [[ "$http_code" -ge 400 ]]; then
+    die "API error ($http_code): $body"
+  fi
+  echo "$body"
+}
+
+api_post() {
+  local response http_code body
+  response=$(curl -sS -w "\n%{http_code}" \
+    -X POST \
+    -H "X-TrackerToken: $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$2" \
+    "$BASE_URL$1")
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+  if [[ "$http_code" -ge 400 ]]; then
+    die "API error ($http_code): $body"
+  fi
+  echo "$body"
+}
+
+
+# --- Commands ---
+
+cmd_auth() {
+  echo "Enter your LiteTracker API token."
+  echo "You can find it at: https://app.litetracker.com/edit"
+  echo ""
+  read -rp "API Token: " token
+  [[ -n "$token" ]] || die "Token cannot be empty."
+
+  mkdir -p "$CONFIG_DIR"
+  echo "$token" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+
+  # Verify token works
+  TOKEN="$token"
+  local me
+  me=$(api_get "/me") || die "Token verification failed. Check your token and try again."
+  local name
+  name=$(echo "$me" | jq -r '.name // "Unknown"')
+  echo "Authenticated as: $name"
+  echo "Token saved to $TOKEN_FILE"
+}
+
+cmd_me() {
+  local data
+  data=$(api_get "/me")
+  echo "$data" | jq '{
+    id,
+    name,
+    initials,
+    username,
+    email,
+    accounts: [.accounts[] | {name, status, plan}],
+    projects: [.projects[] | {project_id, project_name, role}]
+  }'
+}
+
+cmd_projects() {
+  local data
+  data=$(api_get "/projects")
+  (
+    echo -e "ID\tTITLE"
+    echo "$data" | jq -r '.[] | [(.id|tostring), .title] | @tsv'
+  ) | column -ts $'\t'
+}
+
+cmd_stories() {
+  local project_id="${1:?Usage: lt stories <project_id>}"
+  local data
+  data=$(api_get "/projects/$project_id/stories")
+  (
+    echo -e "ID\tTYPE\tSTATE\tTITLE"
+    echo "$data" | jq -r '.[] | [(.id|tostring), .story_type, .current_state, .title] | @tsv'
+  ) | column -ts $'\t'
+}
+
+cmd_story_show() {
+  local project_id="${1:?Usage: lt story show <project_id> <story_id>}"
+  local story_id="${2:?Usage: lt story show <project_id> <story_id>}"
+  local data
+  data=$(api_get "/projects/$project_id/stories/$story_id")
+  echo "$data" | jq '{
+    id,
+    title,
+    story_type,
+    current_state,
+    estimate,
+    url,
+    labels: [.labels[]?.name],
+    created_at,
+    updated_at
+  }'
+}
+
+cmd_story_create() {
+  local project_id="${1:?Usage: lt story create <project_id> --name \"...\"}"
+  shift
+  local name="" story_type="feature" estimate="" label="" description=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)        name="${2:?--name requires a value}"; shift 2 ;;
+      --type)        story_type="${2:?--type requires a value}"; shift 2 ;;
+      --estimate)    estimate="${2:?--estimate requires a value}"; shift 2 ;;
+      --label)       label="${2:?--label requires a value}"; shift 2 ;;
+      --description) description="${2:?--description requires a value}"; shift 2 ;;
+      *)             die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "--name is required"
+
+  local json
+  json=$(jq -n --arg name "$name" --arg type "$story_type" '{name: $name, story_type: $type}')
+  [[ -n "$estimate" ]] && json=$(echo "$json" | jq --argjson est "$estimate" '. + {estimate: $est}')
+  [[ -n "$label" ]] && json=$(echo "$json" | jq --arg lbl "$label" '. + {labels: [{name: $lbl}]}')
+  [[ -n "$description" ]] && json=$(echo "$json" | jq --arg desc "$description" '. + {description: $desc}')
+
+  local result
+  result=$(api_post "/projects/$project_id/stories" "$json")
+  local new_id
+  new_id=$(echo "$result" | jq -r '.id')
+  echo "Created story #$new_id"
+  echo "$result" | jq '{id, title, story_type, current_state, url}'
+}
+
+cmd_story_label() {
+  local project_id="${1:?Usage: lt story label <project_id> <story_id> --label \"...\"}"
+  local story_id="${2:?Usage: lt story label <project_id> <story_id> --label \"...\"}"
+  shift 2
+  local label=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --label) label="${2:?--label requires a value}"; shift 2 ;;
+      *)       die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$label" ]] || die "--label is required"
+
+  local json
+  json=$(jq -n --arg lbl "$label" '{label: {name: $lbl}}')
+  local result
+  result=$(api_post "/projects/$project_id/stories/$story_id/labels" "$json")
+  echo "Added label '$label' to story #$story_id"
+}
+
+cmd_story_comment() {
+  local project_id="${1:?Usage: lt story comment <project_id> <story_id> --text \"...\"}"
+  local story_id="${2:?Usage: lt story comment <project_id> <story_id> --text \"...\"}"
+  shift 2
+  local text=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --text) text="${2:?--text requires a value}"; shift 2 ;;
+      *)      die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$text" ]] || die "--text is required"
+
+  local json
+  json=$(jq -n --arg t "$text" '{text: $t}')
+  local result
+  result=$(api_post "/projects/$project_id/stories/$story_id/comments" "$json")
+  echo "Comment added to story #$story_id"
+}
+
+cmd_help() {
+  cat <<'HELP'
+lt - LiteTracker CLI
+
+Usage:
+  lt <command> [arguments]
+
+Commands:
+  auth                                          Configure API token
+  me                                            Show current user details
+  projects                                      List all projects
+  stories <project_id>                          List stories in a project
+  story show <project_id> <story_id>            Show story details
+  story create <project_id> [flags]             Create a new story
+  story label <project_id> <story_id> [flags]   Add a label to a story
+  story comment <project_id> <story_id> [flags] Add a comment to a story
+  help                                          Show this help
+  version                                       Show version
+
+Story Create Flags:
+  --name "..."         Story name (required)
+  --type TYPE          feature, bug, or chore (default: feature)
+  --estimate N         Point estimate
+  --label "..."        Add a label
+  --description "..."  Story description
+
+Story Label Flags:
+  --label "..."      Label name (required)
+
+Story Comment Flags:
+  --text "..."       Comment text (required)
+
+Setup:
+  1. Get your API token from https://app.litetracker.com/edit
+  2. Run: lt auth
+
+HELP
+}
+
+cmd_version() {
+  echo "lt version $VERSION"
+}
+
+# --- Main Router ---
+
+main() {
+  check_deps
+
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    auth)     cmd_auth "$@" ;;
+    me)       load_token; cmd_me "$@" ;;
+    projects) load_token; cmd_projects "$@" ;;
+    stories)  load_token; cmd_stories "$@" ;;
+    story)
+      load_token
+      local action="${1:-help}"
+      shift || true
+      case "$action" in
+        show)    cmd_story_show "$@" ;;
+        create)  cmd_story_create "$@" ;;
+        label)   cmd_story_label "$@" ;;
+        comment) cmd_story_comment "$@" ;;
+        *)       die "Unknown story action: $action. Use: show, create, label, comment" ;;
+      esac
+      ;;
+    help|-h|--help) cmd_help ;;
+    version|--version|-v) cmd_version ;;
+    *) die "Unknown command: $cmd. Run 'lt help' for usage." ;;
+  esac
+}
+
+main "$@"
