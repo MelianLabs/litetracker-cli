@@ -226,7 +226,7 @@ Available endpoints:
   stories.get           GET /projects/{project_id}/stories/{story_id}
   stories.create        POST /projects/{project_id}/stories
   stories.comments.list GET /projects/{project_id}/stories/{story_id}/comments
-  stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments
+  stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments (NOT WORKING)
   stories.labels.create POST /projects/{project_id}/stories/{story_id}/labels
 
 Example:
@@ -384,7 +384,7 @@ LIST
       }') ;;
     stories.comments.create)
       schema=$(jq -n '{
-        description: "Adds a comment to a story.",
+        description: "Adds a comment to a story. NOTE: This endpoint is currently not supported by LiteTracker (returns 404). Listed for completeness based on the Pivotal Tracker v5 spec.",
         httpMethod: "POST",
         path: "/projects/{project_id}/stories/{story_id}/comments",
         auth: "X-TrackerToken header (required)",
@@ -451,7 +451,7 @@ Commands:
   story create <project_id> [flags]             Create a new story
   story label <project_id> <story_id> [flags]   Add a label to a story
   story comments <project_id> <story_id>          List comments on a story
-  story comment <project_id> <story_id> [flags]   Add a comment to a story
+  story comment <project_id> <story_id> [flags]   Add a comment (NOT WORKING - API returns 404)
   schema [endpoint]                               Show API endpoint details
   help                                          Show this help
   version                                       Show version
