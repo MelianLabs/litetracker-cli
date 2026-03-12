@@ -176,6 +176,20 @@ cmd_story_label() {
   echo "Added label '$label' to story #$story_id"
 }
 
+cmd_story_comments() {
+  local project_id="${1:?Usage: lt story comments <project_id> <story_id>}"
+  local story_id="${2:?Usage: lt story comments <project_id> <story_id>}"
+  local data
+  data=$(api_get "/projects/$project_id/stories/$story_id/comments")
+  local count
+  count=$(echo "$data" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "No comments on story #$story_id"
+    return
+  fi
+  echo "$data" | jq -r '.[] | "--- Comment #\(.id) at \(.created_at) ---\n\(.text)\n"'
+}
+
 cmd_story_comment() {
   local project_id="${1:?Usage: lt story comment <project_id> <story_id> --text \"...\"}"
   local story_id="${2:?Usage: lt story comment <project_id> <story_id> --text \"...\"}"
@@ -196,6 +210,231 @@ cmd_story_comment() {
   echo "Comment added to story #$story_id"
 }
 
+cmd_schema() {
+  local path="${1:-}"
+  if [[ -z "$path" ]]; then
+    cat <<'LIST'
+lt schema — Show API endpoint details
+
+Usage:
+  lt schema <endpoint>
+
+Available endpoints:
+  me                    GET /me
+  projects.list         GET /projects
+  stories.list          GET /projects/{project_id}/stories
+  stories.get           GET /projects/{project_id}/stories/{story_id}
+  stories.create        POST /projects/{project_id}/stories
+  stories.comments.list GET /projects/{project_id}/stories/{story_id}/comments
+  stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments
+  stories.labels.create POST /projects/{project_id}/stories/{story_id}/labels
+
+Example:
+  lt schema stories.create
+LIST
+    return
+  fi
+
+  local schema
+  case "$path" in
+    me)
+      schema=$(jq -n '{
+        description: "Returns information about the authenticated user.",
+        httpMethod: "GET",
+        path: "/me",
+        auth: "X-TrackerToken header (required)",
+        parameters: {},
+        response: {
+          properties: {
+            id: {type: "string", description: "User ID"},
+            name: {type: "string", description: "Full name"},
+            initials: {type: "string", description: "User initials"},
+            username: {type: "string", description: "Username"},
+            email: {type: "string", description: "Email address"},
+            accounts: {type: "array", description: "List of accounts with name, status, plan"},
+            projects: {type: "array", description: "List of projects with project_id, project_name, role"}
+          }
+        }
+      }') ;;
+    projects|projects.list)
+      schema=$(jq -n '{
+        description: "Lists all projects accessible to the authenticated user.",
+        httpMethod: "GET",
+        path: "/projects",
+        auth: "X-TrackerToken header (required)",
+        parameters: {},
+        response: {
+          type: "array",
+          items: {
+            properties: {
+              id: {type: "string", description: "Project ID"},
+              title: {type: "string", description: "Project title"},
+              created_at: {type: "string", description: "Creation timestamp"},
+              updated_at: {type: "string", description: "Last update timestamp"}
+            }
+          }
+        }
+      }') ;;
+    stories.list)
+      schema=$(jq -n '{
+        description: "Lists all stories in a project.",
+        httpMethod: "GET",
+        path: "/projects/{project_id}/stories",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"}
+        },
+        response: {
+          type: "array",
+          items: {
+            properties: {
+              id: {type: "string", description: "Story ID"},
+              title: {type: "string", description: "Story title"},
+              story_type: {type: "string", description: "Type: feature, bug, or chore"},
+              current_state: {type: "string", description: "State: unscheduled, unstarted, started, finished, delivered, accepted, rejected"},
+              estimate: {type: "integer", description: "Point estimate"},
+              labels: {type: "array", description: "Array of label objects with name field"},
+              created_at: {type: "string", description: "Creation timestamp"},
+              updated_at: {type: "string", description: "Last update timestamp"},
+              url: {type: "string", description: "Web URL for the story"}
+            }
+          }
+        }
+      }') ;;
+    stories.get)
+      schema=$(jq -n '{
+        description: "Returns details for a single story.",
+        httpMethod: "GET",
+        path: "/projects/{project_id}/stories/{story_id}",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          story_id: {type: "string", location: "path", required: true, description: "Story ID"}
+        },
+        response: {
+          properties: {
+            id: {type: "string", description: "Story ID"},
+            title: {type: "string", description: "Story title"},
+            story_type: {type: "string", description: "Type: feature, bug, or chore"},
+            current_state: {type: "string", description: "State: unscheduled, unstarted, started, finished, delivered, accepted, rejected"},
+            estimate: {type: "integer", description: "Point estimate"},
+            labels: {type: "array", description: "Array of label objects with name field"},
+            description: {type: "string", description: "Story description"},
+            created_at: {type: "string", description: "Creation timestamp"},
+            updated_at: {type: "string", description: "Last update timestamp"},
+            url: {type: "string", description: "Web URL for the story"}
+          }
+        }
+      }') ;;
+    stories.create)
+      schema=$(jq -n '{
+        description: "Creates a new story in a project. Note: LiteTracker accepts \"name\" for the title field on create, but returns \"title\" in responses.",
+        httpMethod: "POST",
+        path: "/projects/{project_id}/stories",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"}
+        },
+        requestBody: {
+          properties: {
+            name: {type: "string", required: true, description: "Story title (required)"},
+            story_type: {type: "string", required: false, description: "Type: feature (default), bug, or chore"},
+            estimate: {type: "integer", required: false, description: "Point estimate"},
+            description: {type: "string", required: false, description: "Story description"},
+            labels: {type: "array", required: false, description: "Array of label objects, e.g. [{\"name\": \"urgent\"}]"}
+          }
+        },
+        notes: [
+          "owner_ids is ignored — owner assignment not supported by LiteTracker",
+          "PUT/PATCH for story updates returns 404 — not supported"
+        ],
+        response: {
+          properties: {
+            id: {type: "string", description: "Created story ID"},
+            title: {type: "string", description: "Story title"},
+            story_type: {type: "string", description: "Story type"},
+            current_state: {type: "string", description: "Initial state"},
+            url: {type: "string", description: "Web URL for the story"}
+          }
+        }
+      }') ;;
+    stories.comments|stories.comments.list)
+      schema=$(jq -n '{
+        description: "Lists all comments on a story.",
+        httpMethod: "GET",
+        path: "/projects/{project_id}/stories/{story_id}/comments",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          story_id: {type: "string", location: "path", required: true, description: "Story ID"}
+        },
+        response: {
+          type: "array",
+          items: {
+            properties: {
+              id: {type: "string", description: "Comment ID"},
+              text: {type: "string", description: "Comment text"},
+              person_id: {type: "string", description: "ID of the commenter"},
+              story_id: {type: "string", description: "Parent story ID"},
+              created_at: {type: "string", description: "Creation timestamp"},
+              updated_at: {type: "string", description: "Last update timestamp"}
+            }
+          }
+        }
+      }') ;;
+    stories.comments.create)
+      schema=$(jq -n '{
+        description: "Adds a comment to a story.",
+        httpMethod: "POST",
+        path: "/projects/{project_id}/stories/{story_id}/comments",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          story_id: {type: "string", location: "path", required: true, description: "Story ID"}
+        },
+        requestBody: {
+          properties: {
+            text: {type: "string", required: true, description: "Comment text (required)"}
+          }
+        },
+        response: {
+          properties: {
+            id: {type: "string", description: "Comment ID"},
+            text: {type: "string", description: "Comment text"},
+            person_id: {type: "string", description: "ID of the commenter"},
+            created_at: {type: "string", description: "Creation timestamp"}
+          }
+        }
+      }') ;;
+    stories.labels|stories.labels.create)
+      schema=$(jq -n '{
+        description: "Adds a label to a story.",
+        httpMethod: "POST",
+        path: "/projects/{project_id}/stories/{story_id}/labels",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          story_id: {type: "string", location: "path", required: true, description: "Story ID"}
+        },
+        requestBody: {
+          properties: {
+            label: {type: "object", required: true, description: "Label object with name field, e.g. {\"label\": {\"name\": \"urgent\"}}"}
+          }
+        },
+        response: {
+          properties: {
+            id: {type: "string", description: "Label ID"},
+            name: {type: "string", description: "Label name"}
+          }
+        }
+      }') ;;
+    *)
+      die "Unknown schema: $path. Run 'lt schema' to see available endpoints." ;;
+  esac
+
+  echo "$schema"
+}
+
 cmd_help() {
   cat <<'HELP'
 lt - LiteTracker CLI
@@ -211,7 +450,9 @@ Commands:
   story show <project_id> <story_id>            Show story details
   story create <project_id> [flags]             Create a new story
   story label <project_id> <story_id> [flags]   Add a label to a story
-  story comment <project_id> <story_id> [flags] Add a comment to a story
+  story comments <project_id> <story_id>          List comments on a story
+  story comment <project_id> <story_id> [flags]   Add a comment to a story
+  schema [endpoint]                               Show API endpoint details
   help                                          Show this help
   version                                       Show version
 
@@ -260,10 +501,12 @@ main() {
         show)    cmd_story_show "$@" ;;
         create)  cmd_story_create "$@" ;;
         label)   cmd_story_label "$@" ;;
-        comment) cmd_story_comment "$@" ;;
-        *)       die "Unknown story action: $action. Use: show, create, label, comment" ;;
+        comments) cmd_story_comments "$@" ;;
+        comment)  cmd_story_comment "$@" ;;
+        *)        die "Unknown story action: $action. Use: show, create, label, comments, comment" ;;
       esac
       ;;
+    schema)   cmd_schema "$@" ;;
     help|-h|--help) cmd_help ;;
     version|--version|-v) cmd_version ;;
     *) die "Unknown command: $cmd. Run 'lt help' for usage." ;;
