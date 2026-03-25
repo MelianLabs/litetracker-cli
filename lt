@@ -116,6 +116,7 @@ cmd_story_show() {
   echo "$data" | jq '{
     id,
     title,
+    description,
     story_type,
     current_state,
     estimate,
