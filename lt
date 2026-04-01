@@ -51,6 +51,21 @@ api_post() {
   echo "$body"
 }
 
+api_put() {
+  local response http_code body
+  response=$(curl -sS -w "\n%{http_code}" \
+    -X PUT \
+    -H "X-TrackerToken: $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$2" \
+    "$BASE_URL$1")
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+  if [[ "$http_code" -ge 400 ]]; then
+    die "API error ($http_code): $body"
+  fi
+  echo "$body"
+}
 
 # --- Commands ---
 
@@ -120,6 +135,7 @@ cmd_story_show() {
     story_type,
     current_state,
     estimate,
+    owner_ids,
     url,
     labels: [.labels[]?.name],
     created_at,
@@ -150,11 +166,38 @@ cmd_story_create() {
   [[ -n "$description" ]] && json=$(echo "$json" | jq --arg desc "$description" '. + {description: $desc}')
 
   local result
-  result=$(api_post "/projects/$project_id/stories" "$json")
+  result=$(api_post "/projects/$project_id/stories/" "$json")
   local new_id
   new_id=$(echo "$result" | jq -r '.id')
   echo "Created story #$new_id"
   echo "$result" | jq '{id, title, story_type, current_state, url}'
+}
+
+cmd_story_update() {
+  local project_id="${1:?Usage: lt story update <project_id> <story_id> [flags]}"
+  local story_id="${2:?Usage: lt story update <project_id> <story_id> [flags]}"
+  shift 2
+  local state="" estimate="" owner_ids=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state)      state="${2:?--state requires a value}"; shift 2 ;;
+      --estimate)   estimate="${2:?--estimate requires a value}"; shift 2 ;;
+      --owner-ids)  owner_ids="${2:?--owner-ids requires a value}"; shift 2 ;;
+      *)            die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$state" || -n "$estimate" || -n "$owner_ids" ]] || die "At least one of --state, --estimate, or --owner-ids is required"
+
+  local json
+  json=$(jq -n '{}')
+  [[ -n "$state" ]] && json=$(echo "$json" | jq --arg s "$state" '. + {current_state: $s}')
+  [[ -n "$estimate" ]] && json=$(echo "$json" | jq --argjson e "$estimate" '. + {estimate: $e}')
+  [[ -n "$owner_ids" ]] && json=$(echo "$json" | jq --argjson ids "[$owner_ids]" '. + {owner_ids: $ids}')
+
+  local result
+  result=$(api_put "/projects/$project_id/stories/$story_id" "$json")
+  echo "Updated story #$story_id"
+  echo "$result" | jq '{id, title, story_type, current_state, estimate, owner_ids, url}'
 }
 
 cmd_story_label() {
@@ -226,8 +269,9 @@ Available endpoints:
   stories.list          GET /projects/{project_id}/stories
   stories.get           GET /projects/{project_id}/stories/{story_id}
   stories.create        POST /projects/{project_id}/stories
+  stories.update        PUT /projects/{project_id}/stories/{story_id}
   stories.comments.list GET /projects/{project_id}/stories/{story_id}/comments
-  stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments (NOT WORKING)
+  stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments
   stories.labels.create POST /projects/{project_id}/stories/{story_id}/labels
 
 Example:
@@ -295,6 +339,7 @@ LIST
               current_state: {type: "string", description: "State: unscheduled, unstarted, started, finished, delivered, accepted, rejected"},
               estimate: {type: "integer", description: "Point estimate"},
               labels: {type: "array", description: "Array of label objects with name field"},
+              owner_ids: {type: "array", description: "Array of user IDs who own the story"},
               created_at: {type: "string", description: "Creation timestamp"},
               updated_at: {type: "string", description: "Last update timestamp"},
               url: {type: "string", description: "Web URL for the story"}
@@ -320,6 +365,7 @@ LIST
             current_state: {type: "string", description: "State: unscheduled, unstarted, started, finished, delivered, accepted, rejected"},
             estimate: {type: "integer", description: "Point estimate"},
             labels: {type: "array", description: "Array of label objects with name field"},
+            owner_ids: {type: "array", description: "Array of user IDs who own the story"},
             description: {type: "string", description: "Story description"},
             created_at: {type: "string", description: "Creation timestamp"},
             updated_at: {type: "string", description: "Last update timestamp"},
@@ -346,8 +392,7 @@ LIST
           }
         },
         notes: [
-          "owner_ids is ignored — owner assignment not supported by LiteTracker",
-          "PUT/PATCH for story updates returns 404 — not supported"
+          "owner_ids is ignored on create — use story update to assign owners"
         ],
         response: {
           properties: {
@@ -355,6 +400,40 @@ LIST
             title: {type: "string", description: "Story title"},
             story_type: {type: "string", description: "Story type"},
             current_state: {type: "string", description: "Initial state"},
+            url: {type: "string", description: "Web URL for the story"}
+          }
+        }
+      }') ;;
+    stories.update)
+      schema=$(jq -n '{
+        description: "Updates a story'\''s estimate, state, and/or owners. All parameters are optional — include only what you want to change.",
+        httpMethod: "PUT",
+        path: "/projects/{project_id}/stories/{story_id}",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          story_id: {type: "string", location: "path", required: true, description: "Story ID"}
+        },
+        requestBody: {
+          properties: {
+            current_state: {type: "string", required: false, description: "State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted"},
+            estimate: {type: "integer", required: false, description: "Point estimate"},
+            owner_ids: {type: "array", required: false, description: "Array of user IDs to assign as owners"}
+          }
+        },
+        notes: [
+          "State transitions follow AASM rules (e.g., cannot accept a story that has not been delivered)",
+          "For chores and releases, finish automatically maps to accept",
+          "Feature/bug stories require an estimate before starting (unless chores/releases)"
+        ],
+        response: {
+          properties: {
+            id: {type: "string", description: "Story ID"},
+            title: {type: "string", description: "Story title"},
+            story_type: {type: "string", description: "Story type"},
+            current_state: {type: "string", description: "Updated state"},
+            estimate: {type: "integer", description: "Point estimate"},
+            owner_ids: {type: "array", description: "Updated array of user IDs assigned as owners"},
             url: {type: "string", description: "Web URL for the story"}
           }
         }
@@ -385,7 +464,7 @@ LIST
       }') ;;
     stories.comments.create)
       schema=$(jq -n '{
-        description: "Adds a comment to a story. NOTE: This endpoint is currently not supported by LiteTracker (returns 404). Listed for completeness based on the Pivotal Tracker v5 spec.",
+        description: "Adds a comment to a story.",
         httpMethod: "POST",
         path: "/projects/{project_id}/stories/{story_id}/comments",
         auth: "X-TrackerToken header (required)",
@@ -450,9 +529,10 @@ Commands:
   stories <project_id>                          List stories in a project
   story show <project_id> <story_id>            Show story details
   story create <project_id> [flags]             Create a new story
+  story update <project_id> <story_id> [flags]  Update a story
   story label <project_id> <story_id> [flags]   Add a label to a story
   story comments <project_id> <story_id>          List comments on a story
-  story comment <project_id> <story_id> [flags]   Add a comment (NOT WORKING - API returns 404)
+  story comment <project_id> <story_id> [flags]   Add a comment
   schema [endpoint]                               Show API endpoint details
   help                                          Show this help
   version                                       Show version
@@ -463,6 +543,11 @@ Story Create Flags:
   --estimate N         Point estimate
   --label "..."        Add a label
   --description "..."  Story description
+
+Story Update Flags:
+  --state STATE      State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted
+  --estimate N       Point estimate
+  --owner-ids N,...  Comma-separated user IDs
 
 Story Label Flags:
   --label "..."      Label name (required)
@@ -501,10 +586,11 @@ main() {
       case "$action" in
         show)    cmd_story_show "$@" ;;
         create)  cmd_story_create "$@" ;;
+        update)  cmd_story_update "$@" ;;
         label)   cmd_story_label "$@" ;;
         comments) cmd_story_comments "$@" ;;
         comment)  cmd_story_comment "$@" ;;
-        *)        die "Unknown story action: $action. Use: show, create, label, comments, comment" ;;
+        *)        die "Unknown story action: $action. Use: show, create, update, label, comments, comment" ;;
       esac
       ;;
     schema)   cmd_schema "$@" ;;

@@ -69,6 +69,9 @@ lt story create <project_id> --name "Build login page" --type feature --estimate
 # Create a story with description
 lt story create <project_id> --name "Fix bug" --type bug --description "Steps to reproduce..."
 
+# Update a story
+lt story update <project_id> <story_id> --state "started" --estimate 3 --owner-ids 42,55
+
 # Add a label to a story
 lt story label <project_id> <story_id> --label "urgent"
 
