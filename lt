@@ -135,7 +135,7 @@ cmd_story_show() {
     story_type,
     current_state,
     estimate,
-    owner_ids,
+    owner_ids: [.owners[]?.user_id],
     url,
     labels: [.labels[]?.name],
     created_at,
@@ -197,7 +197,7 @@ cmd_story_update() {
   local result
   result=$(api_put "/projects/$project_id/stories/$story_id" "$json")
   echo "Updated story #$story_id"
-  echo "$result" | jq '{id, title, story_type, current_state, estimate, owner_ids, url}'
+  echo "$result" | jq '{id, title, story_type, current_state, estimate, owner_ids: [.owners[]?.user_id], url}'
 }
 
 cmd_story_label() {
