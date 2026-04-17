@@ -114,13 +114,63 @@ cmd_projects() {
 }
 
 cmd_stories() {
-  local project_id="${1:?Usage: lt stories <project_id>}"
-  local data
-  data=$(api_get "/projects/$project_id/stories")
+  local project_id="${1:?Usage: lt stories <project_id> [--all] [--state STATE] [--limit N] [--offset N]}"
+  shift || true
+
+  local fetch_all=0
+  local state=""
+  local limit=""
+  local offset=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) fetch_all=1; shift ;;
+      --state) state="${2:?--state requires a value}"; shift 2 ;;
+      --limit) limit="${2:?--limit requires a value}"; shift 2 ;;
+      --offset) offset="${2:?--offset requires a value}"; shift 2 ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  local base_path="/projects/$project_id/stories"
+  local all_data="[]"
+  local page_size=50
+
+  if [[ "$fetch_all" -eq 1 ]]; then
+    local cur_offset=0
+    local page count
+    while :; do
+      page=$(api_get "${base_path}?offset=${cur_offset}&limit=${page_size}")
+      count=$(echo "$page" | jq 'length')
+      all_data=$(jq -s 'add' <(echo "$all_data") <(echo "$page"))
+      [[ "$count" -lt "$page_size" ]] && break
+      cur_offset=$((cur_offset + page_size))
+    done
+  else
+    local single_qs=""
+    [[ -n "$offset" ]] && single_qs="${single_qs}&offset=${offset}"
+    [[ -n "$limit" ]] && single_qs="${single_qs}&limit=${limit}"
+    single_qs="${single_qs#&}"
+    [[ -n "$single_qs" ]] && single_qs="?${single_qs}"
+    all_data=$(api_get "${base_path}${single_qs}")
+  fi
+
+  # Client-side state filter (API ignores state query param)
+  if [[ -n "$state" ]]; then
+    all_data=$(echo "$all_data" | jq --arg s "$state" '[.[] | select(.current_state == $s)]')
+  fi
+
+  local total
+  total=$(echo "$all_data" | jq 'length')
   (
     echo -e "ID\tTYPE\tSTATE\tTITLE"
-    echo "$data" | jq -r '.[] | [(.id|tostring), .story_type, .current_state, .title] | @tsv'
+    echo "$all_data" | jq -r '.[] | [(.id|tostring), .story_type, .current_state, .title] | @tsv'
   ) | column -ts $'\t'
+
+  if [[ "$fetch_all" -eq 0 && "$total" -eq "$page_size" ]]; then
+    echo >&2
+    echo "Note: returned exactly $page_size rows — more may exist. Re-run with --all to fetch every page." >&2
+  fi
 }
 
 cmd_story_show() {
@@ -322,13 +372,16 @@ LIST
       }') ;;
     stories.list)
       schema=$(jq -n '{
-        description: "Lists all stories in a project.",
+        description: "Lists stories in a project. Paginated — default page size is 50. Use offset/limit query params, or the --all flag on the CLI.",
         httpMethod: "GET",
         path: "/projects/{project_id}/stories",
         auth: "X-TrackerToken header (required)",
         parameters: {
-          project_id: {type: "string", location: "path", required: true, description: "Project ID"}
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          offset: {type: "integer", location: "query", required: false, description: "Number of stories to skip (pagination)"},
+          limit: {type: "integer", location: "query", required: false, description: "Page size (max 50)"}
         },
+        notes: "API does not support server-side state filtering. The lt CLI provides --state as a client-side filter applied after fetching.",
         response: {
           type: "array",
           items: {
@@ -526,7 +579,7 @@ Commands:
   auth                                          Configure API token
   me                                            Show current user details
   projects                                      List all projects
-  stories <project_id>                          List stories in a project
+  stories <project_id> [flags]                  List stories in a project (default: first 50)
   story show <project_id> <story_id>            Show story details
   story create <project_id> [flags]             Create a new story
   story update <project_id> <story_id> [flags]  Update a story
@@ -536,6 +589,12 @@ Commands:
   schema [endpoint]                               Show API endpoint details
   help                                          Show this help
   version                                       Show version
+
+Stories List Flags:
+  --all                Fetch all pages (API returns 50 per page by default)
+  --state STATE        Client-side filter by state (unscheduled, started, finished, delivered, accepted, rejected)
+  --limit N            Page size (max 50)
+  --offset N           Skip the first N stories
 
 Story Create Flags:
   --name "..."         Story name (required)

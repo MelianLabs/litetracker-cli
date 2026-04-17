@@ -23,6 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - JSON built safely with `jq -n --arg` (never string interpolation)
 - Table output: `jq -r @tsv | column -ts $'\t'`
 - Dependencies: bash, curl, jq
+- **Stories pagination:** API caps `/projects/{id}/stories` at 50 rows per response. Use `offset` + `limit` query params to page. The server ignores `state=` — filtering by state is implemented client-side in `cmd_stories` via `jq`. The `--all` flag auto-pages until a short page returns.
 
 ## Testing
 

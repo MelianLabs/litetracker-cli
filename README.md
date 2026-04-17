@@ -57,8 +57,17 @@ lt me
 ### Stories
 
 ```bash
-# List stories in a project
+# List stories in a project (default: first 50)
 lt stories <project_id>
+
+# Fetch all stories across pages (the API caps each page at 50)
+lt stories <project_id> --all
+
+# Client-side filter by state
+lt stories <project_id> --all --state unscheduled
+
+# Manual pagination
+lt stories <project_id> --offset 50 --limit 50
 
 # Show story details
 lt story show <project_id> <story_id>
