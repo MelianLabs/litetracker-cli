@@ -831,12 +831,6 @@ CREATE TEMP TABLE diff_changed AS
   SELECT i.* FROM incoming i JOIN stories s ON s.id = i.id
    WHERE COALESCE(s.updated_at,'') <> COALESCE(i.updated_at,'');
 
-.mode list
-.headers off
-SELECT 'inserted=' || (SELECT COUNT(*) FROM diff_new);
-SELECT 'updated='  || (SELECT COUNT(*) FROM diff_changed);
-SELECT 'unchanged=' || ((SELECT COUNT(*) FROM incoming) - (SELECT COUNT(*) FROM diff_new) - (SELECT COUNT(*) FROM diff_changed));
-
 INSERT INTO stories(id, project_id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data, cached_at)
 SELECT id, $project_id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data, datetime('now')
 FROM diff_new;
@@ -859,15 +853,25 @@ UPDATE stories
 
 DELETE FROM story_labels
  WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
-INSERT INTO story_labels(story_id, label)
+-- OR IGNORE: LT occasionally repeats a label inside a story's labels[] array.
+INSERT OR IGNORE INTO story_labels(story_id, label)
 SELECT story_id, label FROM incoming_labels
  WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
 
 DELETE FROM story_owners
  WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
-INSERT INTO story_owners(story_id, owner_id)
+-- OR IGNORE: LT occasionally repeats an owner inside a story's owners[] array.
+INSERT OR IGNORE INTO story_owners(story_id, owner_id)
 SELECT story_id, owner_id FROM incoming_owners
  WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
+
+-- Counts emitted AFTER writes so a rolled-back transaction never lies to
+-- the caller about how many rows landed.
+.mode list
+.headers off
+SELECT 'inserted=' || (SELECT COUNT(*) FROM diff_new);
+SELECT 'updated='  || (SELECT COUNT(*) FROM diff_changed);
+SELECT 'unchanged=' || ((SELECT COUNT(*) FROM incoming) - (SELECT COUNT(*) FROM diff_new) - (SELECT COUNT(*) FROM diff_changed));
 
 COMMIT;
 SQL
