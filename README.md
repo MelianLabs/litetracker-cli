@@ -17,14 +17,14 @@ git clone https://github.com/MelianLabs/litetracker-cli.git
 sudo cp litetracker-cli/lt /usr/local/bin/lt
 ```
 
-**Dependencies:** bash, curl, [jq](https://jqlang.github.io/jq/)
+**Dependencies:** bash, curl, [jq](https://jqlang.github.io/jq/), and `sqlite3` (only for `lt cache` commands)
 
 ```bash
 # Ubuntu/Debian
-sudo apt install jq
+sudo apt install jq sqlite3
 
 # macOS
-brew install jq
+brew install jq sqlite
 ```
 
 ## Setup
@@ -90,6 +90,52 @@ lt story comments <project_id> <story_id>
 # Add a comment to a story
 lt story comment <project_id> <story_id> --text "Working on this now"
 ```
+
+### Local cache
+
+The LiteTracker API has no server-side filters (no `--label`, no `--state`, no `updated_since`), so any query like "all stories with label X" requires paging through every story 50 at a time. `lt cache` mirrors one or more projects into a local SQLite database so subsequent queries are instant and incremental.
+
+```bash
+# Initial sync — pages through /projects/<id>/stories until done
+lt cache sync 123456
+
+# Incremental re-sync — only stories whose `updated_at` changed are rewritten
+lt cache sync 123456
+
+# Sync several projects at once
+lt cache sync 123456 789012
+
+# Also pull /stories/<id> description and /comments for stories that changed
+lt cache sync 123456 --with-descriptions --with-comments
+
+# Drop the project's rows before re-inserting (rebuild from scratch)
+lt cache sync 123456 --full --quiet
+
+# Query the cache — same output shape as `lt stories`, no API calls
+lt cache stories 123456 --label failing-spec
+lt cache stories 123456 --label failing-spec --state unscheduled
+lt cache stories 123456 --type bug --since 2026-04-01T00:00:00Z
+
+# Inspect cache state
+lt cache stats
+lt cache stats 123456
+
+# Remove cached rows for one project, or wipe the DB entirely
+lt cache clear 123456
+lt cache clear
+```
+
+Cache layout:
+
+- `~/.lt/cache/litetracker.db` — single SQLite file shared across projects.
+- Schema embedded inside the `lt` script (see `cache_schema_sql` function). On every sync `CREATE TABLE IF NOT EXISTS` runs first, so it self-heals.
+- Diff key: each story's `updated_at` timestamp. Re-syncs skip rows whose timestamp matches.
+
+Known limitations (intentional for v1):
+
+- Deletions in LT don't propagate locally until `--full`.
+- Sync is sequential (no parallel curl) — initial sync of a 4000-story project takes a few minutes.
+- `lt stories` (the live command) still hits the API; cache reads are explicit via `lt cache stories`.
 
 ### Schema
 

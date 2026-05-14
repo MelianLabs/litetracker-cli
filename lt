@@ -18,6 +18,10 @@ check_deps() {
   command -v jq >/dev/null 2>&1 || die "jq is required. Install it with: sudo apt install jq"
 }
 
+check_cache_deps() {
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is required for cache commands. Install it with: sudo apt install sqlite3"
+}
+
 load_token() {
   [[ -f "$TOKEN_FILE" ]] || die "Not authenticated. Run 'lt auth' first."
   TOKEN=$(<"$TOKEN_FILE")
@@ -65,6 +69,110 @@ api_put() {
     die "API error ($http_code): $body"
   fi
   echo "$body"
+}
+
+# --- Cache (local SQLite mirror) ---
+#
+# Layout: $CACHE_DIR is created lazily. All projects live in one DB.
+# Schema is embedded inline below so the install stays a single file.
+
+CACHE_DIR="$CONFIG_DIR/cache"
+CACHE_DB="$CACHE_DIR/litetracker.db"
+
+cache_schema_sql() {
+  cat <<'SQL'
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS projects (
+  id             INTEGER PRIMARY KEY,
+  title          TEXT,
+  data           TEXT,
+  last_synced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stories (
+  id                     INTEGER PRIMARY KEY,
+  project_id             INTEGER NOT NULL REFERENCES projects(id),
+  title                  TEXT,
+  story_type             TEXT,
+  current_state          TEXT,
+  estimate               INTEGER,
+  url                    TEXT,
+  created_at             TEXT,
+  updated_at             TEXT,
+  accepted_at            TEXT,
+  description            TEXT,
+  -- These two cache the value of `updated_at` that was current when we last
+  -- fetched the description / comments. Compare with `=` to decide re-fetch
+  -- (LT returns `updated_at` as a free-form string, not ISO, so ordering
+  -- comparisons are unreliable across formats).
+  description_updated_at TEXT,
+  comments_updated_at    TEXT,
+  data                   TEXT,
+  cached_at              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stories_project ON stories(project_id);
+CREATE INDEX IF NOT EXISTS idx_stories_state   ON stories(current_state);
+CREATE INDEX IF NOT EXISTS idx_stories_type    ON stories(story_type);
+CREATE INDEX IF NOT EXISTS idx_stories_updated ON stories(updated_at);
+
+CREATE TABLE IF NOT EXISTS story_labels (
+  story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+  label    TEXT    NOT NULL,
+  PRIMARY KEY (story_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_story_labels_label ON story_labels(label);
+
+CREATE TABLE IF NOT EXISTS story_owners (
+  story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+  owner_id INTEGER NOT NULL,
+  PRIMARY KEY (story_id, owner_id)
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+  id         INTEGER PRIMARY KEY,
+  story_id   INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+  text       TEXT,
+  person_id  INTEGER,
+  created_at TEXT,
+  updated_at TEXT,
+  data       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_comments_story ON comments(story_id);
+
+CREATE TABLE IF NOT EXISTS sync_log (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id           INTEGER NOT NULL,
+  started_at           TEXT,
+  finished_at          TEXT,
+  pages_fetched        INTEGER,
+  stories_inserted     INTEGER,
+  stories_updated      INTEGER,
+  stories_unchanged    INTEGER,
+  comments_fetched     INTEGER,
+  descriptions_fetched INTEGER,
+  status               TEXT,
+  error                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sync_log_project ON sync_log(project_id);
+SQL
+}
+
+cache_init() {
+  check_cache_deps
+  mkdir -p "$CACHE_DIR"
+  # PRAGMA journal_mode prints "wal" to stdout — swallow it.
+  cache_schema_sql | sqlite3 "$CACHE_DB" >/dev/null
+}
+
+cache_db() {
+  sqlite3 -bail "$CACHE_DB" "$@"
+}
+
+# Validate that an argument is a non-negative integer; die otherwise.
+require_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] || die "$2: expected integer, got '$1'"
 }
 
 # --- Commands ---
@@ -568,6 +676,398 @@ LIST
   echo "$schema"
 }
 
+cmd_cache_sync() {
+  check_cache_deps
+  local with_descriptions=0 with_comments=0 full=0 quiet=0
+  local project_ids=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with-descriptions) with_descriptions=1; shift ;;
+      --with-comments)     with_comments=1; shift ;;
+      --full)              full=1; shift ;;
+      --quiet)             quiet=1; shift ;;
+      --) shift; while [[ $# -gt 0 ]]; do project_ids+=("$1"); shift; done ;;
+      -*) die "Unknown flag: $1" ;;
+      *)  project_ids+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#project_ids[@]} -gt 0 ]] || die "Usage: lt cache sync <project_id>... [--full] [--with-descriptions] [--with-comments] [--quiet]"
+
+  cache_init
+
+  local pid
+  for pid in "${project_ids[@]}"; do
+    require_int "$pid" "project_id"
+    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$quiet"
+  done
+}
+
+cache_sync_one_project() {
+  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" quiet="$5"
+  local started_at finished_at status="ok" error=""
+  local stories_inserted=0 stories_updated=0 stories_unchanged=0
+  local pages_fetched=0 comments_fetched=0 descriptions_fetched=0
+
+  started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Ensure the project row exists. Look up the title from /projects.
+  local projects_json title
+  projects_json=$(api_get "/projects")
+  title=$(echo "$projects_json" | jq -r --argjson pid "$project_id" '.[] | select(.id == $pid) | .title // empty' | head -1)
+  cache_upsert_project "$project_id" "$title" "$projects_json"
+
+  if [[ "$full" -eq 1 ]]; then
+    [[ "$quiet" -eq 1 ]] || echo "[$project_id] --full: dropping local rows"
+    cache_db "DELETE FROM stories WHERE project_id = $project_id;"
+  fi
+
+  [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing stories from /projects/$project_id/stories"
+
+  local offset=0 page_size=50 page count
+  while :; do
+    local page
+    page=$(api_get "/projects/$project_id/stories?limit=${page_size}&offset=${offset}")
+    count=$(echo "$page" | jq 'length')
+    if [[ "$count" -gt 0 ]]; then
+      local counts
+      counts=$(cache_sync_page "$project_id" "$page")
+      local p_ins p_upd p_unc
+      p_ins=$(echo "$counts" | awk -F= '/^inserted/  {print $2}')
+      p_upd=$(echo "$counts" | awk -F= '/^updated/   {print $2}')
+      p_unc=$(echo "$counts" | awk -F= '/^unchanged/ {print $2}')
+      stories_inserted=$((stories_inserted + p_ins))
+      stories_updated=$((stories_updated + p_upd))
+      stories_unchanged=$((stories_unchanged + p_unc))
+      pages_fetched=$((pages_fetched + 1))
+      [[ "$quiet" -eq 1 ]] || printf "[%s] page %3d (offset %5d) +%d ~%d =%d\n" \
+        "$project_id" "$pages_fetched" "$offset" "$p_ins" "$p_upd" "$p_unc"
+    fi
+    [[ "$count" -lt "$page_size" ]] && break
+    offset=$((offset + page_size))
+  done
+
+  if [[ "$with_descriptions" -eq 1 ]]; then
+    descriptions_fetched=$(cache_sync_descriptions "$project_id" "$quiet")
+  fi
+
+  if [[ "$with_comments" -eq 1 ]]; then
+    comments_fetched=$(cache_sync_comments "$project_id" "$quiet")
+  fi
+
+  finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cache_db <<SQL
+UPDATE projects SET last_synced_at = '$finished_at' WHERE id = $project_id;
+INSERT INTO sync_log(project_id, started_at, finished_at, pages_fetched, stories_inserted, stories_updated, stories_unchanged, comments_fetched, descriptions_fetched, status, error)
+VALUES ($project_id, '$started_at', '$finished_at', $pages_fetched, $stories_inserted, $stories_updated, $stories_unchanged, $comments_fetched, $descriptions_fetched, '$status', '$error');
+SQL
+
+  echo "[$project_id] done: +${stories_inserted} new, ~${stories_updated} updated, =${stories_unchanged} unchanged (pages: $pages_fetched, descriptions: $descriptions_fetched, comments: $comments_fetched)"
+}
+
+# Upsert one project row given id, title, and the full /projects list JSON.
+cache_upsert_project() {
+  local project_id="$1" title="$2" projects_json="$3"
+  local tmp
+  tmp=$(mktemp)
+  echo "$projects_json" | jq --argjson pid "$project_id" '.[] | select(.id == $pid)' > "$tmp"
+  cache_db <<SQL
+INSERT INTO projects(id, title, data, last_synced_at)
+VALUES ($project_id, $(printf "'%s'" "${title//\'/\'\'}"), readfile('$tmp'), COALESCE((SELECT last_synced_at FROM projects WHERE id = $project_id), NULL))
+ON CONFLICT(id) DO UPDATE SET title = excluded.title, data = excluded.data;
+SQL
+  rm -f "$tmp"
+}
+
+# Sync one page of /stories JSON into the cache.
+# Echoes three lines: inserted=N, updated=N, unchanged=N.
+cache_sync_page() {
+  local project_id="$1" page_json="$2"
+  local tmp
+  tmp=$(mktemp)
+  echo "$page_json" > "$tmp"
+
+  cache_db <<SQL
+BEGIN IMMEDIATE;
+
+CREATE TEMP TABLE incoming(
+  id INTEGER PRIMARY KEY,
+  title TEXT, story_type TEXT, current_state TEXT, estimate INTEGER, url TEXT,
+  created_at TEXT, updated_at TEXT, accepted_at TEXT, data TEXT
+);
+CREATE TEMP TABLE incoming_labels(story_id INTEGER, label TEXT);
+CREATE TEMP TABLE incoming_owners(story_id INTEGER, owner_id INTEGER);
+
+INSERT INTO incoming(id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data)
+SELECT
+  CAST(json_extract(value, '\$.id') AS INTEGER),
+  json_extract(value, '\$.title'),
+  json_extract(value, '\$.story_type'),
+  json_extract(value, '\$.current_state'),
+  CAST(json_extract(value, '\$.estimate') AS INTEGER),
+  json_extract(value, '\$.url'),
+  json_extract(value, '\$.created_at'),
+  json_extract(value, '\$.updated_at'),
+  json_extract(value, '\$.accepted_at'),
+  value
+FROM json_each(readfile('$tmp'));
+
+INSERT INTO incoming_labels(story_id, label)
+SELECT
+  CAST(json_extract(s.value, '\$.id') AS INTEGER),
+  json_extract(l.value, '\$.name')
+FROM json_each(readfile('$tmp')) s, json_each(s.value, '\$.labels') l
+WHERE json_extract(l.value, '\$.name') IS NOT NULL;
+
+INSERT INTO incoming_owners(story_id, owner_id)
+SELECT
+  CAST(json_extract(s.value, '\$.id') AS INTEGER),
+  CAST(json_extract(o.value, '\$.user_id') AS INTEGER)
+FROM json_each(readfile('$tmp')) s, json_each(s.value, '\$.owners') o
+WHERE json_extract(o.value, '\$.user_id') IS NOT NULL;
+
+CREATE TEMP TABLE diff_new AS
+  SELECT i.* FROM incoming i LEFT JOIN stories s ON s.id = i.id WHERE s.id IS NULL;
+CREATE TEMP TABLE diff_changed AS
+  SELECT i.* FROM incoming i JOIN stories s ON s.id = i.id
+   WHERE COALESCE(s.updated_at,'') <> COALESCE(i.updated_at,'');
+
+.mode list
+.headers off
+SELECT 'inserted=' || (SELECT COUNT(*) FROM diff_new);
+SELECT 'updated='  || (SELECT COUNT(*) FROM diff_changed);
+SELECT 'unchanged=' || ((SELECT COUNT(*) FROM incoming) - (SELECT COUNT(*) FROM diff_new) - (SELECT COUNT(*) FROM diff_changed));
+
+INSERT INTO stories(id, project_id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data, cached_at)
+SELECT id, $project_id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data, datetime('now')
+FROM diff_new;
+
+UPDATE stories
+   SET title         = (SELECT title         FROM diff_changed dc WHERE dc.id = stories.id),
+       story_type    = (SELECT story_type    FROM diff_changed dc WHERE dc.id = stories.id),
+       current_state = (SELECT current_state FROM diff_changed dc WHERE dc.id = stories.id),
+       estimate      = (SELECT estimate      FROM diff_changed dc WHERE dc.id = stories.id),
+       url           = (SELECT url           FROM diff_changed dc WHERE dc.id = stories.id),
+       updated_at    = (SELECT updated_at    FROM diff_changed dc WHERE dc.id = stories.id),
+       accepted_at   = (SELECT accepted_at   FROM diff_changed dc WHERE dc.id = stories.id),
+       data          = (SELECT data          FROM diff_changed dc WHERE dc.id = stories.id),
+       -- description / comments caches are now stale; clear the marker so
+       -- subsequent --with-descriptions / --with-comments re-fetches them.
+       description_updated_at = NULL,
+       comments_updated_at    = NULL,
+       cached_at     = datetime('now')
+ WHERE id IN (SELECT id FROM diff_changed);
+
+DELETE FROM story_labels
+ WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
+INSERT INTO story_labels(story_id, label)
+SELECT story_id, label FROM incoming_labels
+ WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
+
+DELETE FROM story_owners
+ WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
+INSERT INTO story_owners(story_id, owner_id)
+SELECT story_id, owner_id FROM incoming_owners
+ WHERE story_id IN (SELECT id FROM diff_new UNION SELECT id FROM diff_changed);
+
+COMMIT;
+SQL
+
+  rm -f "$tmp"
+}
+
+# Re-fetch story descriptions for any story whose description is missing or
+# whose cached `description_updated_at` no longer matches the story's
+# current `updated_at`. Equality compare — LT returns `updated_at` as a free
+# form string, so ordering is unreliable. Echoes the count fetched.
+cache_sync_descriptions() {
+  local project_id="$1" quiet="$2"
+  local ids fetched=0 sid data tmp
+  ids=$(cache_db "SELECT id FROM stories WHERE project_id = $project_id AND (description IS NULL OR description_updated_at IS NULL OR description_updated_at <> updated_at) ORDER BY id;")
+  [[ -z "$ids" ]] && { echo 0; return; }
+  local total
+  total=$(echo "$ids" | wc -l)
+  [[ "$quiet" -eq 1 ]] || echo "[$project_id] fetching $total story descriptions" >&2
+  for sid in $ids; do
+    data=$(api_get "/projects/$project_id/stories/$sid")
+    tmp=$(mktemp)
+    echo "$data" > "$tmp"
+    cache_db <<SQL
+UPDATE stories
+   SET description            = json_extract(readfile('$tmp'), '\$.description'),
+       description_updated_at = updated_at
+ WHERE id = $sid;
+SQL
+    rm -f "$tmp"
+    fetched=$((fetched + 1))
+    if [[ "$quiet" -eq 0 && $((fetched % 50)) -eq 0 ]]; then
+      echo "[$project_id] descriptions: $fetched / $total" >&2
+    fi
+  done
+  echo "$fetched"
+}
+
+# Re-fetch comments for any story whose cached `comments_updated_at` no
+# longer matches the story's current `updated_at`. Equality compare — see
+# cache_sync_descriptions for rationale. Echoes the count fetched.
+cache_sync_comments() {
+  local project_id="$1" quiet="$2"
+  local ids fetched=0 sid data tmp
+  ids=$(cache_db "SELECT id FROM stories WHERE project_id = $project_id AND (comments_updated_at IS NULL OR comments_updated_at <> updated_at) ORDER BY id;")
+  [[ -z "$ids" ]] && { echo 0; return; }
+  local total
+  total=$(echo "$ids" | wc -l)
+  [[ "$quiet" -eq 1 ]] || echo "[$project_id] fetching comments for $total stories" >&2
+  for sid in $ids; do
+    data=$(api_get "/projects/$project_id/stories/$sid/comments")
+    tmp=$(mktemp)
+    echo "$data" > "$tmp"
+    cache_db <<SQL
+BEGIN IMMEDIATE;
+DELETE FROM comments WHERE story_id = $sid;
+INSERT INTO comments(id, story_id, text, person_id, created_at, updated_at, data)
+SELECT
+  CAST(json_extract(value, '\$.id') AS INTEGER),
+  $sid,
+  json_extract(value, '\$.text'),
+  CAST(json_extract(value, '\$.person_id') AS INTEGER),
+  json_extract(value, '\$.created_at'),
+  json_extract(value, '\$.updated_at'),
+  value
+FROM json_each(readfile('$tmp'));
+UPDATE stories SET comments_updated_at = updated_at WHERE id = $sid;
+COMMIT;
+SQL
+    rm -f "$tmp"
+    fetched=$((fetched + 1))
+    if [[ "$quiet" -eq 0 && $((fetched % 50)) -eq 0 ]]; then
+      echo "[$project_id] comments: $fetched / $total" >&2
+    fi
+  done
+  echo "$fetched"
+}
+
+cmd_cache_stories() {
+  check_cache_deps
+  local project_id="${1:?Usage: lt cache stories <project_id> [flags]}"
+  shift
+  require_int "$project_id" "project_id"
+  local state="" type="" label="" since="" limit="" offset=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state)  state="${2:?--state requires a value}"; shift 2 ;;
+      --type)   type="${2:?--type requires a value}"; shift 2 ;;
+      --label)  label="${2:?--label requires a value}"; shift 2 ;;
+      --since)  since="${2:?--since requires a value}"; shift 2 ;;
+      --limit)  limit="${2:?--limit requires a value}"; require_int "$limit" "--limit"; shift 2 ;;
+      --offset) offset="${2:?--offset requires a value}"; require_int "$offset" "--offset"; shift 2 ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -f "$CACHE_DB" ]] || die "No cache found. Run 'lt cache sync $project_id' first."
+
+  local where="WHERE s.project_id = $project_id"
+  if [[ -n "$state"  ]]; then where="$where AND s.current_state = $(sql_lit "$state")"; fi
+  if [[ -n "$type"   ]]; then where="$where AND s.story_type    = $(sql_lit "$type")";  fi
+  if [[ -n "$since"  ]]; then where="$where AND s.updated_at   >= $(sql_lit "$since")"; fi
+  local join=""
+  if [[ -n "$label" ]]; then
+    join="JOIN story_labels sl ON sl.story_id = s.id AND sl.label = $(sql_lit "$label")"
+  fi
+  local pagination=""
+  if [[ -n "$limit" ]]; then
+    pagination="LIMIT $limit"
+    [[ -n "$offset" ]] && pagination="$pagination OFFSET $offset"
+  fi
+
+  (
+    echo -e "ID\tTYPE\tSTATE\tTITLE"
+    cache_db <<SQL
+.mode tabs
+.headers off
+SELECT s.id, s.story_type, s.current_state, s.title
+FROM stories s
+$join
+$where
+ORDER BY s.id DESC
+$pagination;
+SQL
+  ) | column -ts $'\t'
+}
+
+cmd_cache_stats() {
+  check_cache_deps
+  [[ -f "$CACHE_DB" ]] || die "No cache yet. Run 'lt cache sync <project_id>' first."
+  local project_id="${1:-}"
+  local where=""
+  [[ -n "$project_id" ]] && { require_int "$project_id" "project_id"; where="WHERE p.id = $project_id"; }
+
+  echo "Cache: $CACHE_DB"
+  echo
+  (
+    echo -e "PROJECT\tTITLE\tSTORIES\tLABELS\tLAST_SYNCED"
+    cache_db <<SQL
+.mode tabs
+.headers off
+SELECT
+  p.id,
+  COALESCE(p.title, '(unknown)'),
+  (SELECT COUNT(*) FROM stories s WHERE s.project_id = p.id),
+  (SELECT COUNT(DISTINCT label) FROM story_labels sl JOIN stories s ON s.id = sl.story_id WHERE s.project_id = p.id),
+  COALESCE(p.last_synced_at, '-')
+FROM projects p
+$where
+ORDER BY p.id;
+SQL
+  ) | column -ts $'\t'
+
+  echo
+  echo "Recent sync runs:"
+  (
+    echo -e "PROJECT\tFINISHED\tPAGES\t+NEW\t~UPD\t=UNCH\tDESCR\tCOMMENTS\tSTATUS"
+    cache_db <<SQL
+.mode tabs
+.headers off
+SELECT project_id, finished_at, pages_fetched, stories_inserted, stories_updated, stories_unchanged, descriptions_fetched, comments_fetched, status
+FROM sync_log
+${where//p.id/project_id}
+ORDER BY id DESC
+LIMIT 10;
+SQL
+  ) | column -ts $'\t'
+  echo
+  echo "Note: rows reflect each sync — stories deleted in LT after their first sync may persist locally until 'lt cache sync --full'."
+}
+
+cmd_cache_clear() {
+  check_cache_deps
+  [[ -f "$CACHE_DB" ]] || die "No cache to clear."
+  local project_id="${1:-}"
+  if [[ -z "$project_id" ]]; then
+    read -rp "Drop the entire cache at $CACHE_DB? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; return; }
+    rm -f "$CACHE_DB" "$CACHE_DB-wal" "$CACHE_DB-shm"
+    echo "Removed $CACHE_DB"
+    return
+  fi
+  require_int "$project_id" "project_id"
+  read -rp "Drop cached rows for project $project_id? [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; return; }
+  cache_db <<SQL
+DELETE FROM sync_log WHERE project_id = $project_id;
+DELETE FROM stories  WHERE project_id = $project_id;
+DELETE FROM projects WHERE id = $project_id;
+SQL
+  echo "Cleared project $project_id from cache."
+}
+
+# Quote a string as a SQL literal: wrap in single quotes, double any embedded
+# single quotes. Only safe for user-provided plain strings (labels, states).
+sql_lit() {
+  local s="${1//\'/\'\'}"
+  printf "'%s'" "$s"
+}
+
 cmd_help() {
   cat <<'HELP'
 lt - LiteTracker CLI
@@ -587,6 +1087,10 @@ Commands:
   story comments <project_id> <story_id>          List comments on a story
   story comment <project_id> <story_id> [flags]   Add a comment
   schema [endpoint]                               Show API endpoint details
+  cache sync <project_id>... [flags]            Sync project(s) into local SQLite cache
+  cache stories <project_id> [flags]            Query stories from local cache (no API calls)
+  cache stats [<project_id>]                    Show cache stats and recent sync history
+  cache clear [<project_id>]                    Drop cached rows (whole DB or one project)
   help                                          Show this help
   version                                       Show version
 
@@ -613,6 +1117,24 @@ Story Label Flags:
 
 Story Comment Flags:
   --text "..."       Comment text (required)
+
+Cache Sync Flags:
+  --full                 Drop the project's cached rows before re-syncing
+  --with-descriptions    Also fetch /stories/{id} for changed stories
+  --with-comments        Also fetch /stories/{id}/comments for changed stories
+  --quiet                Suppress per-page progress
+
+Cache Stories Flags:
+  --state STATE          Filter by current_state
+  --type TYPE            Filter by story_type (feature/bug/chore)
+  --label LABEL          Filter by label
+  --since ISO8601        Only stories with updated_at >= value
+  --limit N              Page size
+  --offset N             Skip the first N rows
+
+Cache:
+  Location: ~/.lt/cache/litetracker.db (sqlite3)
+  Created lazily on first 'lt cache sync'. Multiple projects share the file.
 
 Setup:
   1. Get your API token from https://app.litetracker.com/edit
@@ -653,6 +1175,17 @@ main() {
       esac
       ;;
     schema)   cmd_schema "$@" ;;
+    cache)
+      local action="${1:-help}"
+      shift || true
+      case "$action" in
+        sync)    load_token; cmd_cache_sync "$@" ;;
+        stories) cmd_cache_stories "$@" ;;
+        stats)   cmd_cache_stats "$@" ;;
+        clear)   cmd_cache_clear "$@" ;;
+        *)       die "Unknown cache action: $action. Use: sync, stories, stats, clear" ;;
+      esac
+      ;;
     help|-h|--help) cmd_help ;;
     version|--version|-v) cmd_version ;;
     *) die "Unknown command: $cmd. Run 'lt help' for usage." ;;

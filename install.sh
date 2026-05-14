@@ -14,5 +14,7 @@ sudo mv /tmp/lt "$INSTALL_DIR/lt"
 
 echo "Installed lt to $INSTALL_DIR/lt"
 echo ""
-echo "Dependencies: jq (install with: sudo apt install jq)"
+echo "Dependencies:"
+echo "  - jq      (sudo apt install jq)        required for all commands"
+echo "  - sqlite3 (sudo apt install sqlite3)   required for 'lt cache' commands"
 echo "Run 'lt auth' to configure your API token."
