@@ -111,6 +111,10 @@ lt cache sync 123456 --with-descriptions --with-comments
 # Drop the project's rows before re-inserting (rebuild from scratch)
 lt cache sync 123456 --full --quiet
 
+# Resume a sync that died partway (e.g. after a 504 at page 277)
+lt cache sync 123456 --start-page 278
+lt cache sync 123456 --start-offset 13850   # same thing, expressed as a story offset
+
 # Query the cache — same output shape as `lt stories`, no API calls
 lt cache stories 123456 --label failing-spec
 lt cache stories 123456 --label failing-spec --state unscheduled
@@ -130,6 +134,8 @@ Cache layout:
 - `~/.lt/cache/litetracker.db` — single SQLite file shared across projects.
 - Schema embedded inside the `lt` script (see `cache_schema_sql` function). On every sync `CREATE TABLE IF NOT EXISTS` runs first, so it self-heals.
 - Diff key: each story's `updated_at` timestamp. Re-syncs skip rows whose timestamp matches.
+
+GET requests retry on 5xx and network errors with exponential backoff (5 attempts: 1s, 2s, 4s, 8s, 16s — override with `LT_API_MAX_ATTEMPTS=N`). If a long sync still dies, re-run with `--start-page` pointing at the page after the last one that succeeded.
 
 Known limitations (intentional for v1):
 

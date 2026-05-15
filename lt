@@ -29,14 +29,47 @@ load_token() {
 }
 
 api_get() {
-  local response http_code body
-  response=$(curl -sS -w "\n%{http_code}" -H "X-TrackerToken: $TOKEN" "$BASE_URL$1")
-  http_code=$(echo "$response" | tail -1)
-  body=$(echo "$response" | sed '$d')
-  if [[ "$http_code" -ge 400 ]]; then
-    die "API error ($http_code): $body"
-  fi
-  echo "$body"
+  local url="$BASE_URL$1"
+  local max_attempts="${LT_API_MAX_ATTEMPTS:-5}" attempt=1 sleep_s=1
+  local response http_code body curl_rc
+
+  while :; do
+    if response=$(curl -sS -w "\n%{http_code}" -H "X-TrackerToken: $TOKEN" "$url" 2>&1); then
+      curl_rc=0
+      http_code=$(echo "$response" | tail -1)
+      body=$(echo "$response" | sed '$d')
+    else
+      curl_rc=$?
+      http_code=0
+      body="$response"
+    fi
+
+    # Success or non-retryable 4xx — return / die immediately.
+    if [[ "$curl_rc" -eq 0 && "$http_code" -lt 500 ]]; then
+      if [[ "$http_code" -ge 400 ]]; then
+        die "API error ($http_code): $body"
+      fi
+      echo "$body"
+      return 0
+    fi
+
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      if [[ "$curl_rc" -ne 0 ]]; then
+        die "curl failed after $max_attempts attempts (rc=$curl_rc): $body"
+      else
+        die "API error ($http_code) after $max_attempts attempts: $body"
+      fi
+    fi
+
+    if [[ "$curl_rc" -ne 0 ]]; then
+      echo "Warning: curl failed (rc=$curl_rc), retrying in ${sleep_s}s (attempt $attempt/$max_attempts)" >&2
+    else
+      echo "Warning: API returned $http_code, retrying in ${sleep_s}s (attempt $attempt/$max_attempts)" >&2
+    fi
+    sleep "$sleep_s"
+    sleep_s=$((sleep_s * 2))
+    attempt=$((attempt + 1))
+  done
 }
 
 api_post() {
@@ -678,7 +711,7 @@ LIST
 
 cmd_cache_sync() {
   check_cache_deps
-  local with_descriptions=0 with_comments=0 full=0 quiet=0
+  local with_descriptions=0 with_comments=0 full=0 quiet=0 start_offset=0
   local project_ids=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -686,24 +719,42 @@ cmd_cache_sync() {
       --with-comments)     with_comments=1; shift ;;
       --full)              full=1; shift ;;
       --quiet)             quiet=1; shift ;;
+      --start-page)
+        [[ -n "${2:-}" ]] || die "--start-page requires a value"
+        require_int "$2" "--start-page"
+        [[ "$2" -ge 1 ]] || die "--start-page must be >= 1"
+        start_offset=$(( ($2 - 1) * 50 ))
+        shift 2 ;;
+      --start-offset)
+        [[ -n "${2:-}" ]] || die "--start-offset requires a value"
+        require_int "$2" "--start-offset"
+        start_offset="$2"
+        shift 2 ;;
       --) shift; while [[ $# -gt 0 ]]; do project_ids+=("$1"); shift; done ;;
       -*) die "Unknown flag: $1" ;;
       *)  project_ids+=("$1"); shift ;;
     esac
   done
-  [[ ${#project_ids[@]} -gt 0 ]] || die "Usage: lt cache sync <project_id>... [--full] [--with-descriptions] [--with-comments] [--quiet]"
+  [[ ${#project_ids[@]} -gt 0 ]] || die "Usage: lt cache sync <project_id>... [--full] [--with-descriptions] [--with-comments] [--start-page N | --start-offset N] [--quiet]"
+
+  if [[ "$start_offset" -gt 0 && "$full" -eq 1 ]]; then
+    die "--start-page/--start-offset cannot be combined with --full (resume only makes sense against an existing cache)"
+  fi
+  if [[ "$start_offset" -gt 0 && ${#project_ids[@]} -gt 1 ]]; then
+    die "--start-page/--start-offset only makes sense with a single project"
+  fi
 
   cache_init
 
   local pid
   for pid in "${project_ids[@]}"; do
     require_int "$pid" "project_id"
-    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$quiet"
+    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$quiet" "$start_offset"
   done
 }
 
 cache_sync_one_project() {
-  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" quiet="$5"
+  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" quiet="$5" start_offset="${6:-0}"
   local started_at finished_at status="ok" error=""
   local stories_inserted=0 stories_updated=0 stories_unchanged=0
   local pages_fetched=0 comments_fetched=0 descriptions_fetched=0
@@ -721,9 +772,16 @@ cache_sync_one_project() {
     cache_db "DELETE FROM stories WHERE project_id = $project_id;"
   fi
 
-  [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing stories from /projects/$project_id/stories"
+  local page_size=50
+  if [[ "$start_offset" -gt 0 ]]; then
+    local start_page=$(( start_offset / page_size + 1 ))
+    [[ "$quiet" -eq 1 ]] || echo "[$project_id] resuming stories sync at page $start_page (offset $start_offset)"
+  else
+    [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing stories from /projects/$project_id/stories"
+  fi
 
-  local offset=0 page_size=50 page count
+  local offset=$start_offset page count
+  local page_num=$(( start_offset / page_size + 1 ))
   while :; do
     local page
     page=$(api_get "/projects/$project_id/stories?limit=${page_size}&offset=${offset}")
@@ -740,10 +798,11 @@ cache_sync_one_project() {
       stories_unchanged=$((stories_unchanged + p_unc))
       pages_fetched=$((pages_fetched + 1))
       [[ "$quiet" -eq 1 ]] || printf "[%s] page %3d (offset %5d) +%d ~%d =%d\n" \
-        "$project_id" "$pages_fetched" "$offset" "$p_ins" "$p_upd" "$p_unc"
+        "$project_id" "$page_num" "$offset" "$p_ins" "$p_upd" "$p_unc"
     fi
     [[ "$count" -lt "$page_size" ]] && break
     offset=$((offset + page_size))
+    page_num=$((page_num + 1))
   done
 
   if [[ "$with_descriptions" -eq 1 ]]; then
@@ -1126,7 +1185,12 @@ Cache Sync Flags:
   --full                 Drop the project's cached rows before re-syncing
   --with-descriptions    Also fetch /stories/{id} for changed stories
   --with-comments        Also fetch /stories/{id}/comments for changed stories
+  --start-page N         Resume paging from page N (1-indexed; single project only)
+  --start-offset N       Resume paging from stories offset N (single project only)
   --quiet                Suppress per-page progress
+
+  GET requests retry on 5xx / network errors with exponential backoff
+  (5 attempts: 1s, 2s, 4s, 8s, 16s). Override with LT_API_MAX_ATTEMPTS=N.
 
 Cache Stories Flags:
   --state STATE          Filter by current_state

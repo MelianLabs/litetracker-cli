@@ -22,6 +22,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - API base URL: `https://app.litetracker.com/services/v5`
 - Auth header: `X-TrackerToken`
 - JSON built safely with `jq -n --arg` (never string interpolation)
+- `api_get` retries 5xx and curl/network failures with exponential backoff (1s, 2s, 4s, 8s, 16s — 5 attempts; tunable via `LT_API_MAX_ATTEMPTS`). 4xx fails fast. `api_post`/`api_put` deliberately do NOT retry — writes are not guaranteed idempotent.
 - Table output: `jq -r @tsv | column -ts $'\t'`
 - Dependencies: bash, curl, jq, and `sqlite3` (only for `lt cache` commands; gated by `check_cache_deps`)
 - **Stories pagination:** API caps `/projects/{id}/stories` at 50 rows per response. Use `offset` + `limit` query params to page. The server ignores `state=` — filtering by state is implemented client-side in `cmd_stories` via `jq`. The `--all` flag auto-pages until a short page returns.
