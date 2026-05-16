@@ -1,10 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
+
+# Canonical list of "in-flight" states — everything that isn't shipped
+# (accepted) and isn't in the icebox (unscheduled). Used by --active on
+# stories, cache sync, and cache stories. The server-side filter DSL only
+# accepts ONE clause per request; --active sends `filter=-state:accepted`
+# server-side and drops `unscheduled` client-side after the response.
+ACTIVE_STATES=(unstarted planned started finished delivered rejected)
+
+# The LT API has two surprising behaviors we learned empirically:
+#
+# 1. `offset` is silently ignored when `filter=` is in the query string.
+#    Paginating a filtered list will loop forever (each "next page" returns
+#    the same first slice). Workaround: request a high `limit` and accept
+#    the answer in one shot. The server's 30s gateway timeout is the real
+#    cap there.
+# 2. The documented "50 per page" cap is not actually enforced. `limit=10000`
+#    works for small projects; large/legacy projects (e.g. 254 with ~17k
+#    stories) 504 on anything bigger than ~50 even unfiltered.
+#
+# So we use two separate page sizes:
+#   - STORIES_PAGE_SIZE_FILTERED  high (filtered queries can't paginate)
+#   - STORIES_PAGE_SIZE_UNFILTERED low (lets pagination work on huge projects)
+#
+# Override with LT_STORIES_PAGE_SIZE_FILTERED / LT_STORIES_PAGE_SIZE.
+STORIES_PAGE_SIZE="${LT_STORIES_PAGE_SIZE:-50}"
+STORIES_PAGE_SIZE_FILTERED="${LT_STORIES_PAGE_SIZE_FILTERED:-1000}"
 
 # --- Helpers ---
 
@@ -34,6 +60,8 @@ api_get() {
   local response http_code body curl_rc
 
   while :; do
+    local t0 t1 ms
+    [[ "${LT_DEBUG:-0}" == "1" ]] && t0=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))')
     if response=$(curl -sS -w "\n%{http_code}" -H "X-TrackerToken: $TOKEN" "$url" 2>&1); then
       curl_rc=0
       http_code=$(echo "$response" | tail -1)
@@ -42,6 +70,16 @@ api_get() {
       curl_rc=$?
       http_code=0
       body="$response"
+    fi
+    if [[ "${LT_DEBUG:-0}" == "1" ]]; then
+      t1=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))')
+      ms=$(( t1 - t0 ))
+      local sz="?" cnt="?"
+      if [[ "$curl_rc" -eq 0 && "$http_code" -lt 400 ]]; then
+        sz=$(printf "%s" "$body" | wc -c | tr -d ' ')
+        cnt=$(printf "%s" "$body" | jq 'if type=="array" then length else "n/a" end' 2>/dev/null || echo "?")
+      fi
+      printf "[lt-debug] GET %s -> %s in %sms (%s bytes, %s items)\n" "$url" "$http_code" "$ms" "$sz" "$cnt" >&2
     fi
 
     # Success or non-retryable 4xx — return / die immediately.
@@ -208,6 +246,132 @@ require_int() {
   [[ "$1" =~ ^[0-9]+$ ]] || die "$2: expected integer, got '$1'"
 }
 
+# URL-encode a single component using jq's @uri filter. Used to safely embed
+# filter DSL strings (which contain ':' and '-') into the query string.
+url_encode() {
+  jq -nr --arg s "$1" '$s | @uri'
+}
+
+# Resolve the user-supplied filter flags into the *single* server-side filter
+# clause we'll send (LT only honors one) and a JSON object of remaining
+# client-side filters to apply after fetching.
+#
+# Inputs are passed positionally:
+#   $1 active (0/1)  $2 state  $3 exclude_state  $4 type  $5 label
+#   $6 raw_filter (already-formed DSL string; bypasses all flag mapping)
+#
+# Outputs (stdout, one per line):
+#   server_filter=<dsl_or_empty>
+#   client_type=<value_or_empty>
+#   client_label=<value_or_empty>
+#
+# Precedence (most specific wins server-side): raw_filter > active >
+# state > exclude_state > label > type. Whatever is "lost" at the server
+# boundary falls back to client-side filtering. --active is the only flag
+# that turns into multiple server sweeps (one per ACTIVE_STATES entry);
+# the caller handles that loop separately.
+resolve_filters() {
+  local active="$1" state="$2" exclude_state="$3" type="$4" label="$5" raw_filter="$6"
+  local server="" client_type="" client_label=""
+
+  if [[ -n "$raw_filter" ]]; then
+    server="$raw_filter"
+    # If the caller mixed raw filter with friendly flags, layer them
+    # client-side rather than silently dropping them.
+    client_type="$type"
+    client_label="$label"
+  elif [[ "$active" -eq 1 ]]; then
+    # Active mode does its own multi-sweep — leave server empty here and
+    # let the caller loop ACTIVE_STATES.
+    client_type="$type"
+    client_label="$label"
+  elif [[ -n "$state" ]]; then
+    server="state:$state"
+    client_type="$type"
+    client_label="$label"
+  elif [[ -n "$exclude_state" ]]; then
+    server="-state:$exclude_state"
+    client_type="$type"
+    client_label="$label"
+  elif [[ -n "$label" ]]; then
+    server="label:$label"
+    client_type="$type"
+  elif [[ -n "$type" ]]; then
+    server="type:$type"
+  fi
+
+  printf "server_filter=%s\nclient_type=%s\nclient_label=%s\n" \
+    "$server" "$client_type" "$client_label"
+}
+
+# Build the ?filter=...&offset=...&limit=... query string from a server-side
+# filter DSL clause (may be empty) plus optional offset/limit.
+build_qs() {
+  local filter="$1" offset="$2" limit="$3"
+  local qs=""
+  [[ -n "$filter" ]] && qs="${qs}&filter=$(url_encode "$filter")"
+  [[ -n "$offset" ]] && qs="${qs}&offset=${offset}"
+  [[ -n "$limit" ]]  && qs="${qs}&limit=${limit}"
+  qs="${qs#&}"
+  [[ -n "$qs" ]] && qs="?${qs}"
+  printf "%s" "$qs"
+}
+
+# Validate that --state/--exclude-state/--type/--filter values look sane.
+require_state()      { [[ "$1" =~ ^(unscheduled|unstarted|planned|started|finished|delivered|rejected|accepted)$ ]] || die "$2: unknown state '$1'. Valid: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted"; }
+require_story_type() { [[ "$1" =~ ^(feature|bug|chore|release)$ ]] || die "$2: unknown type '$1'. Valid: feature, bug, chore, release"; }
+
+# Fetch /projects/<id>/stories with optional server-side filter, returning
+# a single JSON array of all matching rows.
+#
+# Args:
+#   $1 base_path     "/projects/<id>/stories"
+#   $2 server_filter raw filter clause; empty for no filter
+#   $3 fetch_all     1 to keep paging when filter is empty (always on for sync)
+#   $4 offset        only used when fetch_all=0 and no filter
+#   $5 limit         only used when fetch_all=0 and no filter (override page size)
+#
+# Behavior:
+#   - Filter present: ONE request with limit=STORIES_PAGE_SIZE. The server
+#     ignores `offset` on filtered queries, so pagination would loop
+#     forever. We warn (and stop) if the response equals the limit — the
+#     user should bump LT_STORIES_PAGE_SIZE.
+#   - No filter, fetch_all=1: paginate using offset until a short page lands.
+#   - No filter, fetch_all=0: single request honoring user-supplied offset/limit.
+fetch_stories_list() {
+  local base_path="$1" server_filter="$2" fetch_all="$3" user_offset="$4" user_limit="$5"
+  local data="[]" page count qs
+
+  if [[ -n "$server_filter" ]]; then
+    qs=$(build_qs "$server_filter" "" "$STORIES_PAGE_SIZE_FILTERED")
+    page=$(api_get "${base_path}${qs}")
+    count=$(echo "$page" | jq 'length')
+    data="$page"
+    if [[ "$count" -ge "$STORIES_PAGE_SIZE_FILTERED" ]]; then
+      echo "Warning: filtered result hit the limit ($STORIES_PAGE_SIZE_FILTERED rows). The LT API ignores 'offset' on filtered queries, so we cannot page further. Bump LT_STORIES_PAGE_SIZE_FILTERED to fetch the rest." >&2
+    fi
+    printf "%s" "$data"
+    return
+  fi
+
+  if [[ "$fetch_all" -eq 1 ]]; then
+    local cur_offset=0
+    while :; do
+      qs=$(build_qs "" "$cur_offset" "$STORIES_PAGE_SIZE")
+      page=$(api_get "${base_path}${qs}")
+      count=$(echo "$page" | jq 'length')
+      data=$(jq -s 'add' <(echo "$data") <(echo "$page"))
+      [[ "$count" -lt "$STORIES_PAGE_SIZE" ]] && break
+      cur_offset=$((cur_offset + STORIES_PAGE_SIZE))
+    done
+    printf "%s" "$data"
+    return
+  fi
+
+  qs=$(build_qs "" "$user_offset" "${user_limit:-$STORIES_PAGE_SIZE}")
+  api_get "${base_path}${qs}"
+}
+
 # --- Commands ---
 
 cmd_auth() {
@@ -255,50 +419,71 @@ cmd_projects() {
 }
 
 cmd_stories() {
-  local project_id="${1:?Usage: lt stories <project_id> [--all] [--state STATE] [--limit N] [--offset N]}"
+  local project_id="${1:?Usage: lt stories <project_id> [flags]  (see 'lt help')}"
   shift || true
+  require_int "$project_id" "project_id"
 
-  local fetch_all=0
-  local state=""
-  local limit=""
-  local offset=""
+  local fetch_all=0 active=0
+  local state="" exclude_state="" type="" label="" raw_filter=""
+  local limit="" offset=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --all) fetch_all=1; shift ;;
-      --state) state="${2:?--state requires a value}"; shift 2 ;;
-      --limit) limit="${2:?--limit requires a value}"; shift 2 ;;
-      --offset) offset="${2:?--offset requires a value}"; shift 2 ;;
+      --all)            fetch_all=1; shift ;;
+      --active)         active=1; shift ;;
+      --state)          state="${2:?--state requires a value}"; require_state "$state" "--state"; shift 2 ;;
+      --exclude-state)  exclude_state="${2:?--exclude-state requires a value}"; require_state "$exclude_state" "--exclude-state"; shift 2 ;;
+      --type)           type="${2:?--type requires a value}"; require_story_type "$type" "--type"; shift 2 ;;
+      --label)          label="${2:?--label requires a value}"; shift 2 ;;
+      --filter)         raw_filter="${2:?--filter requires a value}"; shift 2 ;;
+      --limit)          limit="${2:?--limit requires a value}"; require_int "$limit" "--limit"; shift 2 ;;
+      --offset)         offset="${2:?--offset requires a value}"; require_int "$offset" "--offset"; shift 2 ;;
       *) die "Unknown flag: $1" ;;
     esac
   done
 
-  local base_path="/projects/$project_id/stories"
-  local all_data="[]"
-  local page_size=50
-
-  if [[ "$fetch_all" -eq 1 ]]; then
-    local cur_offset=0
-    local page count
-    while :; do
-      page=$(api_get "${base_path}?offset=${cur_offset}&limit=${page_size}")
-      count=$(echo "$page" | jq 'length')
-      all_data=$(jq -s 'add' <(echo "$all_data") <(echo "$page"))
-      [[ "$count" -lt "$page_size" ]] && break
-      cur_offset=$((cur_offset + page_size))
-    done
-  else
-    local single_qs=""
-    [[ -n "$offset" ]] && single_qs="${single_qs}&offset=${offset}"
-    [[ -n "$limit" ]] && single_qs="${single_qs}&limit=${limit}"
-    single_qs="${single_qs#&}"
-    [[ -n "$single_qs" ]] && single_qs="?${single_qs}"
-    all_data=$(api_get "${base_path}${single_qs}")
+  if [[ "$active" -eq 1 && -n "$state" ]]; then
+    die "--active and --state are mutually exclusive (use one or the other)"
+  fi
+  if [[ "$active" -eq 1 && -n "$exclude_state" ]]; then
+    die "--active and --exclude-state are mutually exclusive"
   fi
 
-  # Client-side state filter (API ignores state query param)
-  if [[ -n "$state" ]]; then
-    all_data=$(echo "$all_data" | jq --arg s "$state" '[.[] | select(.current_state == $s)]')
+  local resolved server_filter client_type client_label
+  resolved=$(resolve_filters "$active" "$state" "$exclude_state" "$type" "$label" "$raw_filter")
+  server_filter=$(echo "$resolved" | awk -F= '/^server_filter=/  {sub(/^server_filter=/,"");  print}')
+  client_type=$(  echo "$resolved" | awk -F= '/^client_type=/    {sub(/^client_type=/,"");    print}')
+  client_label=$( echo "$resolved" | awk -F= '/^client_label=/   {sub(/^client_label=/,"");   print}')
+
+  local base_path="/projects/$project_id/stories"
+  local all_data="[]"
+
+  # Build the list of server-side filter clauses to sweep. --active expands
+  # to one clause per ACTIVE_STATES entry (one API call each — no pagination,
+  # since the server ignores `offset` on filtered queries and each state
+  # bucket fits comfortably under STORIES_PAGE_SIZE). Everything else is a
+  # single sweep using the resolved server filter clause.
+  local -a sweeps=()
+  if [[ "$active" -eq 1 ]]; then
+    local s
+    for s in "${ACTIVE_STATES[@]}"; do sweeps+=("state:$s"); done
+  else
+    sweeps=("$server_filter")
+  fi
+
+  local sweep page
+  for sweep in "${sweeps[@]}"; do
+    [[ "${LT_DEBUG:-0}" == "1" ]] && printf "[lt-debug] sweep: filter=%s\n" "${sweep:-<none>}" >&2
+    page=$(fetch_stories_list "$base_path" "$sweep" "$fetch_all" "$offset" "$limit")
+    all_data=$(jq -s 'add' <(echo "$all_data") <(echo "$page"))
+  done
+
+  # Client-side refinement layers on top of the server-side filter.
+  if [[ -n "$client_type" ]]; then
+    all_data=$(echo "$all_data" | jq --arg t "$client_type" '[.[] | select(.story_type == $t)]')
+  fi
+  if [[ -n "$client_label" ]]; then
+    all_data=$(echo "$all_data" | jq --arg l "$client_label" '[.[] | select(.labels[]?.name == $l)]')
   fi
 
   local total
@@ -308,9 +493,11 @@ cmd_stories() {
     echo "$all_data" | jq -r '.[] | [(.id|tostring), .story_type, .current_state, .title] | @tsv'
   ) | column -ts $'\t'
 
-  if [[ "$fetch_all" -eq 0 && "$total" -eq "$page_size" ]]; then
+  # Truncation note: only meaningful for an unpaged, unfiltered, user-limited
+  # call (fetch_stories_list applies STORIES_PAGE_SIZE otherwise).
+  if [[ "$fetch_all" -eq 0 && "$active" -eq 0 && -z "$server_clause" && -n "$limit" && "$total" -eq "$limit" ]]; then
     echo >&2
-    echo "Note: returned exactly $page_size rows — more may exist. Re-run with --all to fetch every page." >&2
+    echo "Note: returned exactly $limit rows — more may exist. Re-run with --all to fetch every page." >&2
   fi
 }
 
@@ -519,10 +706,31 @@ LIST
         auth: "X-TrackerToken header (required)",
         parameters: {
           project_id: {type: "string", location: "path", required: true, description: "Project ID"},
-          offset: {type: "integer", location: "query", required: false, description: "Number of stories to skip (pagination)"},
-          limit: {type: "integer", location: "query", required: false, description: "Page size (max 50)"}
+          offset:  {type: "integer", location: "query", required: false, description: "Number of stories to skip (pagination)"},
+          limit:   {type: "integer", location: "query", required: false, description: "Page size (max 50)"},
+          filter:  {type: "string",  location: "query", required: false, description: "Single-clause Pivotal-style filter DSL — see filterDsl below"}
         },
-        notes: "API does not support server-side state filtering. The lt CLI provides --state as a client-side filter applied after fetching.",
+        filterDsl: {
+          summary: "Server-side filter via ?filter=<clause>. Only ONE clause per request is honored — multi-clause expressions (space-, plus-, or comma-separated) silently return [].",
+          working: {
+            "state:<state>":         "Match stories whose current_state equals <state>",
+            "-state:<state>":        "Exclude stories whose current_state equals <state> (negation)",
+            "type:<type>":           "Match stories whose story_type is feature/bug/chore/release",
+            "label:<name>":          "Match stories carrying this label"
+          },
+          notKnownToWork: [
+            "Combining clauses with space, +, comma, pipe, or OR — all return []",
+            "Multiple filter= query params — last one wins",
+            "owner:<username>, owner_id:<id> — silently ignored (returns the full unfiltered list)",
+            "?state=<x>, ?current_state=<x> as standalone params — silently ignored"
+          ],
+          examples: [
+            "/projects/1089/stories?filter=state:started&limit=50",
+            "/projects/1089/stories?filter=-state:accepted&limit=200",
+            "/projects/1089/stories?filter=label:ai"
+          ]
+        },
+        notes: "Multi-clause expressions are not supported server-side; the lt CLI emulates AND across state+label+type by sweeping the most-selective clause server-side and layering the rest client-side. The --active flag on lt stories / lt cache sync expands into one server sweep per ACTIVE_STATES entry (unstarted, planned, started, finished, delivered, rejected) — i.e. everything that is not accepted or icebox.",
         response: {
           type: "array",
           items: {
@@ -712,6 +920,12 @@ LIST
 cmd_cache_sync() {
   check_cache_deps
   local with_descriptions=0 with_comments=0 full=0 quiet=0 start_offset=0
+  # Default: full unfiltered pagination — works on every project. The
+  # server-side filter DSL (used by --active, --state, etc.) is much faster
+  # when it works, but on large/legacy projects the filtered endpoint times
+  # out at 30s server-side. Keep server-side filters opt-in.
+  local active=0
+  local state="" exclude_state="" type="" label="" raw_filter=""
   local project_ids=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -719,6 +933,12 @@ cmd_cache_sync() {
       --with-comments)     with_comments=1; shift ;;
       --full)              full=1; shift ;;
       --quiet)             quiet=1; shift ;;
+      --active)            active=1; shift ;;
+      --state)             state="${2:?--state requires a value}"; require_state "$state" "--state"; shift 2 ;;
+      --exclude-state)     exclude_state="${2:?--exclude-state requires a value}"; require_state "$exclude_state" "--exclude-state"; shift 2 ;;
+      --type)              type="${2:?--type requires a value}"; require_story_type "$type" "--type"; shift 2 ;;
+      --label)             label="${2:?--label requires a value}"; shift 2 ;;
+      --filter)            raw_filter="${2:?--filter requires a value}"; shift 2 ;;
       --start-page)
         [[ -n "${2:-}" ]] || die "--start-page requires a value"
         require_int "$2" "--start-page"
@@ -735,7 +955,7 @@ cmd_cache_sync() {
       *)  project_ids+=("$1"); shift ;;
     esac
   done
-  [[ ${#project_ids[@]} -gt 0 ]] || die "Usage: lt cache sync <project_id>... [--full] [--with-descriptions] [--with-comments] [--start-page N | --start-offset N] [--quiet]"
+  [[ ${#project_ids[@]} -gt 0 ]] || die "Usage: lt cache sync <project_id>... [flags]  (see 'lt help')"
 
   if [[ "$start_offset" -gt 0 && "$full" -eq 1 ]]; then
     die "--start-page/--start-offset cannot be combined with --full (resume only makes sense against an existing cache)"
@@ -743,18 +963,37 @@ cmd_cache_sync() {
   if [[ "$start_offset" -gt 0 && ${#project_ids[@]} -gt 1 ]]; then
     die "--start-page/--start-offset only makes sense with a single project"
   fi
+  if [[ "$start_offset" -gt 0 && "$active" -eq 1 ]]; then
+    die "--start-page/--start-offset is incompatible with --active (the active sweep is one request per state). Drop --active to resume against the unfiltered pagination, or restart the active sweep from scratch."
+  fi
+
+  # Build the list of server-side filter clauses to sweep through.
+  local -a sweeps=()
+  if [[ "$active" -eq 1 ]]; then
+    local s
+    for s in "${ACTIVE_STATES[@]}"; do sweeps+=("state:$s"); done
+  else
+    local resolved server_filter
+    resolved=$(resolve_filters 0 "$state" "$exclude_state" "$type" "$label" "$raw_filter")
+    server_filter=$(echo "$resolved" | awk -F= '/^server_filter=/ {sub(/^server_filter=/,""); print}')
+    sweeps=("$server_filter")
+  fi
 
   cache_init
 
   local pid
   for pid in "${project_ids[@]}"; do
     require_int "$pid" "project_id"
-    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$quiet" "$start_offset"
+    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$quiet" "$start_offset" "$active" "${sweeps[@]}"
   done
 }
 
 cache_sync_one_project() {
   local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" quiet="$5" start_offset="${6:-0}"
+  local active="$7"
+  shift 7
+  local -a sweeps=("$@")
+
   local started_at finished_at status="ok" error=""
   local stories_inserted=0 stories_updated=0 stories_unchanged=0
   local pages_fetched=0 comments_fetched=0 descriptions_fetched=0
@@ -772,37 +1011,55 @@ cache_sync_one_project() {
     cache_db "DELETE FROM stories WHERE project_id = $project_id;"
   fi
 
-  local page_size=50
-  if [[ "$start_offset" -gt 0 ]]; then
-    local start_page=$(( start_offset / page_size + 1 ))
-    [[ "$quiet" -eq 1 ]] || echo "[$project_id] resuming stories sync at page $start_page (offset $start_offset)"
+  local mode_label
+  if [[ "$active" -eq 1 ]]; then
+    mode_label="active sweep (${#sweeps[@]} states)"
+  elif [[ -n "${sweeps[0]}" ]]; then
+    mode_label="filter=${sweeps[0]}"
   else
-    [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing stories from /projects/$project_id/stories"
+    mode_label="unfiltered pagination"
   fi
+  [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing /projects/$project_id/stories ($mode_label)"
 
-  local offset=$start_offset page count
-  local page_num=$(( start_offset / page_size + 1 ))
-  while :; do
-    local page
-    page=$(api_get "/projects/$project_id/stories?limit=${page_size}&offset=${offset}")
+  # When there's no filter (e.g. --all-states or raw --filter that resolved
+  # to empty), we want pagination so we can keep STORIES_PAGE_SIZE small AND
+  # support resume via --start-offset. fetch_stories_list handles that
+  # internally. When a filter IS present, the server returns everything in
+  # one shot (it ignores offset for filtered queries).
+  #
+  # For a filtered sweep we set fetch_all=1 but fetch_stories_list short-
+  # circuits to a single request. For an unfiltered sweep we honor
+  # start_offset on the FIRST sweep only — subsequent sweeps would only
+  # exist if active mode were on, which always has a filter.
+  local sweep page count
+  for sweep in "${sweeps[@]}"; do
+    [[ "$active" -eq 1 && "$quiet" -ne 1 ]] && echo "[$project_id]  -> sweep ${sweep}"
+    [[ "${LT_DEBUG:-0}" == "1" ]] && printf "[lt-debug] cache sync sweep: filter=%s\n" "${sweep:-<none>}" >&2
+
+    if [[ -z "$sweep" && "$start_offset" -gt 0 ]]; then
+      # Resume: paginate manually from start_offset for the first sweep only.
+      local cur_offset=$start_offset
+      while :; do
+        local qs
+        qs=$(build_qs "" "$cur_offset" "$STORIES_PAGE_SIZE")
+        page=$(api_get "/projects/$project_id/stories${qs}")
+        count=$(echo "$page" | jq 'length')
+        if [[ "$count" -gt 0 ]]; then
+          apply_page_to_cache "$project_id" "$page" "$quiet" "$cur_offset" stories_inserted stories_updated stories_unchanged pages_fetched
+        fi
+        [[ "$count" -lt "$STORIES_PAGE_SIZE" ]] && break
+        cur_offset=$((cur_offset + STORIES_PAGE_SIZE))
+      done
+      start_offset=0
+      continue
+    fi
+
+    page=$(fetch_stories_list "/projects/$project_id/stories" "$sweep" 1 "" "")
     count=$(echo "$page" | jq 'length')
     if [[ "$count" -gt 0 ]]; then
-      local counts
-      counts=$(cache_sync_page "$project_id" "$page")
-      local p_ins p_upd p_unc
-      p_ins=$(echo "$counts" | awk -F= '/^inserted/  {print $2}')
-      p_upd=$(echo "$counts" | awk -F= '/^updated/   {print $2}')
-      p_unc=$(echo "$counts" | awk -F= '/^unchanged/ {print $2}')
-      stories_inserted=$((stories_inserted + p_ins))
-      stories_updated=$((stories_updated + p_upd))
-      stories_unchanged=$((stories_unchanged + p_unc))
-      pages_fetched=$((pages_fetched + 1))
-      [[ "$quiet" -eq 1 ]] || printf "[%s] page %3d (offset %5d) +%d ~%d =%d\n" \
-        "$project_id" "$page_num" "$offset" "$p_ins" "$p_upd" "$p_unc"
+      apply_page_to_cache "$project_id" "$page" "$quiet" 0 stories_inserted stories_updated stories_unchanged pages_fetched
     fi
-    [[ "$count" -lt "$page_size" ]] && break
-    offset=$((offset + page_size))
-    page_num=$((page_num + 1))
+    start_offset=0
   done
 
   if [[ "$with_descriptions" -eq 1 ]]; then
@@ -821,6 +1078,27 @@ VALUES ($project_id, '$started_at', '$finished_at', $pages_fetched, $stories_ins
 SQL
 
   echo "[$project_id] done: +${stories_inserted} new, ~${stories_updated} updated, =${stories_unchanged} unchanged (pages: $pages_fetched, descriptions: $descriptions_fetched, comments: $comments_fetched)"
+}
+
+# Apply one fetched page (any size) of /stories JSON to the cache via
+# cache_sync_page and update the named counter variables in-place.
+#
+# Args: project_id, page_json, quiet, offset_for_log,
+#       inserted_var, updated_var, unchanged_var, pages_var
+apply_page_to_cache() {
+  local project_id="$1" page_json="$2" quiet="$3" off_log="$4"
+  local -n _ins=$5 _upd=$6 _unc=$7 _pages=$8
+  local counts p_ins p_upd p_unc
+  counts=$(cache_sync_page "$project_id" "$page_json")
+  p_ins=$(echo "$counts" | awk -F= '/^inserted/  {print $2}')
+  p_upd=$(echo "$counts" | awk -F= '/^updated/   {print $2}')
+  p_unc=$(echo "$counts" | awk -F= '/^unchanged/ {print $2}')
+  _ins=$((_ins + p_ins))
+  _upd=$((_upd + p_upd))
+  _unc=$((_unc + p_unc))
+  _pages=$((_pages + 1))
+  [[ "$quiet" -eq 1 ]] || printf "[%s] page (offset %5d) +%d ~%d =%d\n" \
+    "$project_id" "$off_log" "$p_ins" "$p_upd" "$p_unc"
 }
 
 # Upsert one project row given id, title, and the full /projects list JSON.
@@ -1011,28 +1289,44 @@ SQL
 
 cmd_cache_stories() {
   check_cache_deps
-  local project_id="${1:?Usage: lt cache stories <project_id> [flags]}"
+  local project_id="${1:?Usage: lt cache stories <project_id> [flags]  (see 'lt help')}"
   shift
   require_int "$project_id" "project_id"
-  local state="" type="" label="" since="" limit="" offset=""
+  local state="" exclude_state="" type="" label="" since="" limit="" offset=""
+  local active=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --state)  state="${2:?--state requires a value}"; shift 2 ;;
-      --type)   type="${2:?--type requires a value}"; shift 2 ;;
-      --label)  label="${2:?--label requires a value}"; shift 2 ;;
-      --since)  since="${2:?--since requires a value}"; shift 2 ;;
-      --limit)  limit="${2:?--limit requires a value}"; require_int "$limit" "--limit"; shift 2 ;;
-      --offset) offset="${2:?--offset requires a value}"; require_int "$offset" "--offset"; shift 2 ;;
+      --active)        active=1; shift ;;
+      --state)         state="${2:?--state requires a value}"; require_state "$state" "--state"; shift 2 ;;
+      --exclude-state) exclude_state="${2:?--exclude-state requires a value}"; require_state "$exclude_state" "--exclude-state"; shift 2 ;;
+      --type)          type="${2:?--type requires a value}"; require_story_type "$type" "--type"; shift 2 ;;
+      --label)         label="${2:?--label requires a value}"; shift 2 ;;
+      --since)         since="${2:?--since requires a value}"; shift 2 ;;
+      --limit)         limit="${2:?--limit requires a value}"; require_int "$limit" "--limit"; shift 2 ;;
+      --offset)        offset="${2:?--offset requires a value}"; require_int "$offset" "--offset"; shift 2 ;;
       *) die "Unknown flag: $1" ;;
     esac
   done
 
+  if [[ "$active" -eq 1 && -n "$state" ]]; then
+    die "--active and --state are mutually exclusive"
+  fi
+
   [[ -f "$CACHE_DB" ]] || die "No cache found. Run 'lt cache sync $project_id' first."
 
   local where="WHERE s.project_id = $project_id"
-  if [[ -n "$state"  ]]; then where="$where AND s.current_state = $(sql_lit "$state")"; fi
-  if [[ -n "$type"   ]]; then where="$where AND s.story_type    = $(sql_lit "$type")";  fi
-  if [[ -n "$since"  ]]; then where="$where AND s.updated_at   >= $(sql_lit "$since")"; fi
+  if [[ "$active" -eq 1 ]]; then
+    local in_list="" s
+    for s in "${ACTIVE_STATES[@]}"; do
+      [[ -n "$in_list" ]] && in_list="$in_list,"
+      in_list="$in_list$(sql_lit "$s")"
+    done
+    where="$where AND s.current_state IN ($in_list)"
+  fi
+  if [[ -n "$state"         ]]; then where="$where AND s.current_state =  $(sql_lit "$state")"; fi
+  if [[ -n "$exclude_state" ]]; then where="$where AND s.current_state <> $(sql_lit "$exclude_state")"; fi
+  if [[ -n "$type"          ]]; then where="$where AND s.story_type    =  $(sql_lit "$type")";  fi
+  if [[ -n "$since"         ]]; then where="$where AND s.updated_at   >=  $(sql_lit "$since")"; fi
   local join=""
   if [[ -n "$label" ]]; then
     join="JOIN story_labels sl ON sl.story_id = s.id AND sl.label = $(sql_lit "$label")"
@@ -1159,9 +1453,24 @@ Commands:
 
 Stories List Flags:
   --all                Fetch all pages (API returns 50 per page by default)
-  --state STATE        Client-side filter by state (unscheduled, started, finished, delivered, accepted, rejected)
-  --limit N            Page size (max 50)
-  --offset N           Skip the first N stories
+  --active             Loop server-side filter across ACTIVE_STATES — i.e. all
+                       stories that are not accepted and not in the icebox
+                       (unstarted, planned, started, finished, delivered,
+                       rejected). Implies a full-paginated sweep per state.
+  --state STATE        Server-side filter via ?filter=state:<state>.
+                       Valid: unscheduled, unstarted, planned, started,
+                       finished, delivered, rejected, accepted.
+  --exclude-state S    Server-side filter via ?filter=-state:<state> (negation).
+  --type TYPE          Filter by story_type. Server-side when no other state
+                       filter is present, otherwise applied client-side.
+                       Valid: feature, bug, chore, release.
+  --label NAME         Filter by label. Server-side when no state filter is
+                       present, otherwise applied client-side.
+  --filter "<dsl>"     Raw single-clause Pivotal-style filter DSL passthrough
+                       — overrides the friendlier flags above. See
+                       'lt schema stories.list' for working clauses.
+  --limit N            Page size (max 50; ignored when --all or --active)
+  --offset N           Skip the first N stories (ignored when --all/--active)
 
 Story Create Flags:
   --name "..."         Story name (required)
@@ -1182,23 +1491,45 @@ Story Comment Flags:
   --text "..."       Comment text (required)
 
 Cache Sync Flags:
-  --full                 Drop the project's cached rows before re-syncing
-  --with-descriptions    Also fetch /stories/{id} for changed stories
-  --with-comments        Also fetch /stories/{id}/comments for changed stories
-  --start-page N         Resume paging from page N (1-indexed; single project only)
-  --start-offset N       Resume paging from stories offset N (single project only)
-  --quiet                Suppress per-page progress
+  Default behavior: unfiltered pagination — works on every project. The
+  server-side filter DSL (--active, --state, etc.) is much faster on
+  small/well-indexed projects, but on large/legacy projects the filtered
+  endpoint times out at the LT 30s server-side gateway limit, so it is
+  opt-in.
+
+  --active               Sweep ACTIVE_STATES server-side (one request per
+                         state in unstarted, planned, started, finished,
+                         delivered, rejected). Skips accepted + icebox.
+                         Fast when the LT filter endpoint works for this
+                         project; may 504 on large/legacy projects.
+  --state STATE          Single-state sweep using ?filter=state:<state>.
+  --exclude-state S      Single sweep using ?filter=-state:<state>.
+  --type TYPE            Single sweep using ?filter=type:<type>.
+  --label NAME           Single sweep using ?filter=label:<name>.
+  --filter "<dsl>"       Raw single-clause filter DSL passthrough.
+                         See 'lt schema stories.list' for working clauses.
+  --full                 Drop the project's cached rows before re-syncing.
+  --with-descriptions    Also fetch /stories/{id} for changed stories.
+  --with-comments        Also fetch /stories/{id}/comments for changed stories.
+  --start-page N         Resume paging from page N (1-indexed). Single project,
+                         requires the default unfiltered pagination (no
+                         --active/--state/--filter), incompatible with --full.
+  --start-offset N       Resume paging from stories offset N. Same constraints.
+  --quiet                Suppress per-page progress.
 
   GET requests retry on 5xx / network errors with exponential backoff
   (5 attempts: 1s, 2s, 4s, 8s, 16s). Override with LT_API_MAX_ATTEMPTS=N.
 
 Cache Stories Flags:
-  --state STATE          Filter by current_state
-  --type TYPE            Filter by story_type (feature/bug/chore)
-  --label LABEL          Filter by label
-  --since ISO8601        Only stories with updated_at >= value
-  --limit N              Page size
-  --offset N             Skip the first N rows
+  --active               State IN (unstarted, planned, started, finished,
+                         delivered, rejected) — mirrors the sync default.
+  --state STATE          Filter by current_state.
+  --exclude-state STATE  Exclude current_state.
+  --type TYPE            Filter by story_type (feature/bug/chore/release).
+  --label LABEL          Filter by label.
+  --since ISO8601        Only stories with updated_at >= value.
+  --limit N              Page size.
+  --offset N             Skip the first N rows.
 
 Cache:
   Location: ~/.lt/cache/litetracker.db (sqlite3)
