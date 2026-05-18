@@ -1134,7 +1134,11 @@ CREATE TEMP TABLE incoming(
 CREATE TEMP TABLE incoming_labels(story_id INTEGER, label TEXT);
 CREATE TEMP TABLE incoming_owners(story_id INTEGER, owner_id INTEGER);
 
-INSERT INTO incoming(id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data)
+-- OR IGNORE: LT occasionally returns the same story twice inside a single
+-- page response (observed on /projects/254/stories offset=0). The temp table
+-- has id INTEGER PRIMARY KEY, so without OR IGNORE the whole page transaction
+-- aborts with "UNIQUE constraint failed: incoming.id" and the page is lost.
+INSERT OR IGNORE INTO incoming(id, title, story_type, current_state, estimate, url, created_at, updated_at, accepted_at, data)
 SELECT
   CAST(json_extract(value, '\$.id') AS INTEGER),
   json_extract(value, '\$.title'),
