@@ -506,6 +506,7 @@ cmd_story_show() {
   local story_id="${2:?Usage: lt story show <project_id> <story_id>}"
   local data
   data=$(api_get "/projects/$project_id/stories/$story_id")
+  cache_writethrough_story "$project_id" "$data"
   echo "$data" | jq '{
     id,
     title,
@@ -545,6 +546,7 @@ cmd_story_create() {
 
   local result
   result=$(api_post "/projects/$project_id/stories/" "$json")
+  cache_writethrough_story "$project_id" "$result"
   local new_id
   new_id=$(echo "$result" | jq -r '.id')
   echo "Created story #$new_id"
@@ -574,6 +576,7 @@ cmd_story_update() {
 
   local result
   result=$(api_put "/projects/$project_id/stories/$story_id" "$json")
+  cache_writethrough_story "$project_id" "$result"
   echo "Updated story #$story_id"
   echo "$result" | jq '{id, title, story_type, current_state, estimate, owner_ids: [.owners[]?.user_id], url}'
 }
@@ -1289,6 +1292,41 @@ SQL
     fi
   done
   echo "$fetched"
+}
+
+# Write-through: persist a single full-story JSON into the cache.
+# Opt-in by existence: silently no-op if the user has never run `lt cache sync`
+# (so non-cache users never touch sqlite3) or if sqlite3 isn't installed. Also
+# no-op if the story's project hasn't been cached yet — the FK would reject it
+# and we don't want to fabricate a half-populated projects row.
+#
+# Reuses cache_sync_page for the row + labels + owners. Layers in `description`
+# afterward since list-endpoint syncs don't see it and show/update do.
+cache_writethrough_story() {
+  local project_id="$1" story_json="$2"
+  [[ -f "$CACHE_DB" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  local has_project
+  has_project=$(cache_db "SELECT 1 FROM projects WHERE id = $project_id LIMIT 1;" 2>/dev/null) || return 0
+  [[ -n "$has_project" ]] || return 0
+
+  local page_json
+  page_json=$(jq -nc --argjson s "$story_json" '[$s]') || return 0
+  cache_sync_page "$project_id" "$page_json" >/dev/null 2>&1 || return 0
+
+  if [[ "$(echo "$story_json" | jq 'has("description")')" == "true" ]]; then
+    local sid tmp
+    sid=$(echo "$story_json" | jq -r '.id')
+    tmp=$(mktemp)
+    echo "$story_json" > "$tmp"
+    cache_db <<SQL 2>/dev/null || true
+UPDATE stories
+   SET description            = json_extract(readfile('$tmp'), '\$.description'),
+       description_updated_at = updated_at
+ WHERE id = $sid;
+SQL
+    rm -f "$tmp"
+  fi
 }
 
 cmd_cache_stories() {
