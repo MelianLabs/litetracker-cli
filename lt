@@ -525,7 +525,7 @@ cmd_story_show() {
 cmd_story_create() {
   local project_id="${1:?Usage: lt story create <project_id> --name \"...\"}"
   shift
-  local name="" story_type="feature" estimate="" label="" description=""
+  local name="" story_type="feature" estimate="" label="" description="" owner_ids=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name)        name="${2:?--name requires a value}"; shift 2 ;;
@@ -533,6 +533,7 @@ cmd_story_create() {
       --estimate)    estimate="${2:?--estimate requires a value}"; shift 2 ;;
       --label)       label="${2:?--label requires a value}"; shift 2 ;;
       --description) description="${2:?--description requires a value}"; shift 2 ;;
+      --owner-ids)   owner_ids="${2:?--owner-ids requires a value}"; shift 2 ;;
       *)             die "Unknown flag: $1" ;;
     esac
   done
@@ -549,8 +550,26 @@ cmd_story_create() {
   cache_writethrough_story "$project_id" "$result"
   local new_id
   new_id=$(echo "$result" | jq -r '.id')
+
+  # The LT API silently ignores owner_ids on create (verified empirically —
+  # labels apply but owners do not), so `--owner-ids` is a convenience wrapper:
+  # set the owners with a follow-up update on the freshly-created story.
+  if [[ -n "$owner_ids" ]]; then
+    local owner_json owner_result
+    owner_json=$(jq -n --argjson ids "[$owner_ids]" '{owner_ids: $ids}')
+    if owner_result=$(api_put "/projects/$project_id/stories/$new_id" "$owner_json"); then
+      result="$owner_result"
+      cache_writethrough_story "$project_id" "$result"
+    else
+      # Create succeeded; only owner assignment failed. Surface the new id so
+      # the story is never silently orphaned, and show the manual fix.
+      echo "Created story #$new_id" >&2
+      die "story #$new_id was created but owner assignment failed (see error above). Assign manually: lt story update $project_id $new_id --owner-ids $owner_ids"
+    fi
+  fi
+
   echo "Created story #$new_id"
-  echo "$result" | jq '{id, title, story_type, current_state, url}'
+  echo "$result" | jq '{id, title, story_type, current_state, owner_ids: [.owners[]?.user_id], url}'
 }
 
 cmd_story_update() {
@@ -793,11 +812,12 @@ LIST
             story_type: {type: "string", required: false, description: "Type: feature (default), bug, or chore"},
             estimate: {type: "integer", required: false, description: "Point estimate"},
             description: {type: "string", required: false, description: "Story description"},
-            labels: {type: "array", required: false, description: "Array of label objects, e.g. [{\"name\": \"urgent\"}]"}
+            labels: {type: "array", required: false, description: "Array of label objects, e.g. [{\"name\": \"urgent\"}]"},
+            owner_ids: {type: "array", required: false, description: "CLI-only convenience (--owner-ids). The API ignores owners on create, so the CLI assigns them via a follow-up update — not a real create-endpoint field."}
           }
         },
         notes: [
-          "owner_ids is ignored on create — use story update to assign owners"
+          "The API itself ignores owner_ids on create. The lt CLI accepts --owner-ids and fires a follow-up story update to assign owners; a direct API call must use story update."
         ],
         response: {
           properties: {
@@ -805,6 +825,7 @@ LIST
             title: {type: "string", description: "Story title"},
             story_type: {type: "string", description: "Story type"},
             current_state: {type: "string", description: "Initial state"},
+            owner_ids: {type: "array", description: "User IDs assigned as owners (populated when --owner-ids was passed)"},
             url: {type: "string", description: "Web URL for the story"}
           }
         }
@@ -1520,6 +1541,9 @@ Story Create Flags:
   --estimate N         Point estimate
   --label "..."        Add a label
   --description "..."  Story description
+  --owner-ids N,...    Comma-separated user IDs to assign as owners. The API
+                       ignores owners on create, so this fires a follow-up
+                       update automatically.
 
 Story Update Flags:
   --state STATE      State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted
