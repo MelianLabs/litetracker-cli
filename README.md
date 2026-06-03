@@ -78,6 +78,10 @@ lt story create <project_id> --name "Build login page" --type feature --estimate
 # Create a story with description
 lt story create <project_id> --name "Fix bug" --type bug --description "Steps to reproduce..."
 
+# Create a story and assign owner(s) in one command
+# (the API ignores owners on create, so the CLI fires a follow-up update for you)
+lt story create <project_id> --name "Fix bug" --type bug --label "backend" --owner-ids 42,55
+
 # Update a story
 lt story update <project_id> <story_id> --state "started" --estimate 3 --owner-ids 42,55
 
