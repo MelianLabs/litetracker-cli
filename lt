@@ -201,6 +201,31 @@ CREATE TABLE IF NOT EXISTS story_owners (
   PRIMARY KEY (story_id, owner_id)
 );
 
+-- People are global: the same person appears in many projects' membership
+-- lists, and stories reference them by user_id (== person id). Keeping people
+-- separate from the per-project `memberships` join lets us answer both
+-- "who are all our users" and "who is on project X, in what role".
+CREATE TABLE IF NOT EXISTS people (
+  id        INTEGER PRIMARY KEY,
+  name      TEXT,
+  email     TEXT,
+  initials  TEXT,
+  username  TEXT,
+  data      TEXT,
+  cached_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+  id         INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  person_id  INTEGER NOT NULL REFERENCES people(id),
+  role       TEXT,
+  data       TEXT,
+  cached_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memberships_project ON memberships(project_id);
+CREATE INDEX IF NOT EXISTS idx_memberships_person  ON memberships(person_id);
+
 CREATE TABLE IF NOT EXISTS comments (
   id         INTEGER PRIMARY KEY,
   story_id   INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
@@ -415,6 +440,17 @@ cmd_projects() {
   (
     echo -e "ID\tTITLE"
     echo "$data" | jq -r '.[] | [(.id|tostring), .title] | @tsv'
+  ) | column -ts $'\t'
+}
+
+cmd_members() {
+  local project_id="${1:?Usage: lt members <project_id>}"
+  require_int "$project_id" "project_id"
+  local data
+  data=$(api_get "/projects/$project_id/memberships")
+  (
+    echo -e "PERSON_ID\tNAME\tINITIALS\tUSERNAME\tEMAIL\tROLE"
+    echo "$data" | jq -r '.[] | [(.person.id|tostring), .person.name, .person.initials, .person.username, .person.email, .role] | @tsv'
   ) | column -ts $'\t'
 }
 
@@ -666,6 +702,7 @@ Usage:
 Available endpoints:
   me                    GET /me
   projects.list         GET /projects
+  memberships.list      GET /projects/{project_id}/memberships
   stories.list          GET /projects/{project_id}/stories
   stories.get           GET /projects/{project_id}/stories/{story_id}
   stories.create        POST /projects/{project_id}/stories
@@ -716,6 +753,27 @@ LIST
               title: {type: "string", description: "Project title"},
               created_at: {type: "string", description: "Creation timestamp"},
               updated_at: {type: "string", description: "Last update timestamp"}
+            }
+          }
+        }
+      }') ;;
+    memberships|memberships.list)
+      schema=$(jq -n '{
+        description: "Lists the members (people) of a project and their roles.",
+        httpMethod: "GET",
+        path: "/projects/{project_id}/memberships",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"}
+        },
+        response: {
+          type: "array",
+          items: {
+            properties: {
+              id:         {type: "integer", description: "Membership ID (per-project)"},
+              project_id: {type: "integer", description: "Project ID"},
+              role:       {type: "string",  description: "Role: owner, member, viewer, etc."},
+              person:     {type: "object",  description: "Person: {id, name, email, initials, username}"}
             }
           }
         }
@@ -943,7 +1001,7 @@ LIST
 
 cmd_cache_sync() {
   check_cache_deps
-  local with_descriptions=0 with_comments=0 full=0 quiet=0 start_offset=0
+  local with_descriptions=0 with_comments=0 with_members=0 full=0 quiet=0 start_offset=0
   # Default: full unfiltered pagination — works on every project. The
   # server-side filter DSL (used by --active, --state, etc.) is much faster
   # when it works, but on large/legacy projects the filtered endpoint times
@@ -955,6 +1013,7 @@ cmd_cache_sync() {
     case "$1" in
       --with-descriptions) with_descriptions=1; shift ;;
       --with-comments)     with_comments=1; shift ;;
+      --with-members)      with_members=1; shift ;;
       --full)              full=1; shift ;;
       --quiet)             quiet=1; shift ;;
       --active)            active=1; shift ;;
@@ -1008,19 +1067,19 @@ cmd_cache_sync() {
   local pid
   for pid in "${project_ids[@]}"; do
     require_int "$pid" "project_id"
-    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$quiet" "$start_offset" "$active" "${sweeps[@]}"
+    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$with_members" "$quiet" "$start_offset" "$active" "${sweeps[@]}"
   done
 }
 
 cache_sync_one_project() {
-  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" quiet="$5" start_offset="${6:-0}"
-  local active="$7"
-  shift 7
+  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" with_members="$5" quiet="$6" start_offset="${7:-0}"
+  local active="$8"
+  shift 8
   local -a sweeps=("$@")
 
   local started_at finished_at status="ok" error=""
   local stories_inserted=0 stories_updated=0 stories_unchanged=0
-  local pages_fetched=0 comments_fetched=0 descriptions_fetched=0
+  local pages_fetched=0 comments_fetched=0 descriptions_fetched=0 members_fetched=0
 
   started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -1094,6 +1153,10 @@ cache_sync_one_project() {
     comments_fetched=$(cache_sync_comments "$project_id" "$quiet")
   fi
 
+  if [[ "$with_members" -eq 1 ]]; then
+    members_fetched=$(cache_sync_members "$project_id" "$quiet")
+  fi
+
   finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   cache_db <<SQL
 UPDATE projects SET last_synced_at = '$finished_at' WHERE id = $project_id;
@@ -1101,7 +1164,7 @@ INSERT INTO sync_log(project_id, started_at, finished_at, pages_fetched, stories
 VALUES ($project_id, '$started_at', '$finished_at', $pages_fetched, $stories_inserted, $stories_updated, $stories_unchanged, $comments_fetched, $descriptions_fetched, '$status', '$error');
 SQL
 
-  echo "[$project_id] done: +${stories_inserted} new, ~${stories_updated} updated, =${stories_unchanged} unchanged (pages: $pages_fetched, descriptions: $descriptions_fetched, comments: $comments_fetched)"
+  echo "[$project_id] done: +${stories_inserted} new, ~${stories_updated} updated, =${stories_unchanged} unchanged (pages: $pages_fetched, descriptions: $descriptions_fetched, comments: $comments_fetched, members: $members_fetched)"
 }
 
 # Apply one fetched page (any size) of /stories JSON to the cache via
@@ -1315,6 +1378,56 @@ SQL
   echo "$fetched"
 }
 
+# Fetch /projects/{id}/memberships and upsert into people + memberships.
+# `people` is global (a person belongs to many projects); `memberships` is the
+# per-project join carrying the role. Echoes the count fetched.
+cache_sync_members() {
+  local project_id="$1" quiet="$2"
+  local data tmp count
+  data=$(api_get "/projects/$project_id/memberships")
+  count=$(echo "$data" | jq 'length')
+  [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing $count memberships" >&2
+  tmp=$(mktemp)
+  echo "$data" > "$tmp"
+  cache_db <<SQL
+BEGIN IMMEDIATE;
+
+-- Upsert people globally — refresh name/email/etc. from the latest sweep.
+INSERT INTO people(id, name, email, initials, username, data, cached_at)
+SELECT
+  CAST(json_extract(value, '\$.person.id') AS INTEGER),
+  json_extract(value, '\$.person.name'),
+  json_extract(value, '\$.person.email'),
+  json_extract(value, '\$.person.initials'),
+  json_extract(value, '\$.person.username'),
+  json_extract(value, '\$.person'),
+  datetime('now')
+FROM json_each(readfile('$tmp'))
+WHERE json_extract(value, '\$.person.id') IS NOT NULL
+ON CONFLICT(id) DO UPDATE SET
+  name=excluded.name, email=excluded.email, initials=excluded.initials,
+  username=excluded.username, data=excluded.data, cached_at=excluded.cached_at;
+
+-- Replace this project's membership rows wholesale so people who left the
+-- project are dropped. People rows are kept (other projects may reference them).
+DELETE FROM memberships WHERE project_id = $project_id;
+INSERT OR IGNORE INTO memberships(id, project_id, person_id, role, data, cached_at)
+SELECT
+  CAST(json_extract(value, '\$.id') AS INTEGER),
+  $project_id,
+  CAST(json_extract(value, '\$.person.id') AS INTEGER),
+  json_extract(value, '\$.role'),
+  value,
+  datetime('now')
+FROM json_each(readfile('$tmp'))
+WHERE json_extract(value, '\$.id') IS NOT NULL;
+
+COMMIT;
+SQL
+  rm -f "$tmp"
+  echo "$count"
+}
+
 # Write-through: persist a single full-story JSON into the cache.
 # Opt-in by existence: silently no-op if the user has never run `lt cache sync`
 # (so non-cache users never touch sqlite3) or if sqlite3 isn't installed. Also
@@ -1425,7 +1538,7 @@ cmd_cache_stats() {
   echo "Cache: $CACHE_DB"
   echo
   (
-    echo -e "PROJECT\tTITLE\tSTORIES\tLABELS\tLAST_SYNCED"
+    echo -e "PROJECT\tTITLE\tSTORIES\tLABELS\tMEMBERS\tLAST_SYNCED"
     cache_db <<SQL
 .mode tabs
 .headers off
@@ -1434,6 +1547,7 @@ SELECT
   COALESCE(p.title, '(unknown)'),
   (SELECT COUNT(*) FROM stories s WHERE s.project_id = p.id),
   (SELECT COUNT(DISTINCT label) FROM story_labels sl JOIN stories s ON s.id = sl.story_id WHERE s.project_id = p.id),
+  (SELECT COUNT(*) FROM memberships m WHERE m.project_id = p.id),
   COALESCE(p.last_synced_at, '-')
 FROM projects p
 $where
@@ -1459,6 +1573,41 @@ SQL
   echo "Note: rows reflect each sync — stories deleted in LT after their first sync may persist locally until 'lt cache sync --full'."
 }
 
+# List cached members. With a project_id: everyone on that project + their
+# role. Without: every distinct person across all cached projects, with a count
+# of how many cached projects they belong to.
+cmd_cache_members() {
+  check_cache_deps
+  [[ -f "$CACHE_DB" ]] || die "No cache yet. Run 'lt cache sync <project_id> --with-members' first."
+  local project_id="${1:-}"
+  if [[ -n "$project_id" ]]; then
+    require_int "$project_id" "project_id"
+    (
+      echo -e "PERSON_ID\tNAME\tINITIALS\tUSERNAME\tEMAIL\tROLE"
+      cache_db <<SQL
+.mode tabs
+.headers off
+SELECT pe.id, COALESCE(pe.name,''), COALESCE(pe.initials,''), COALESCE(pe.username,''), COALESCE(pe.email,''), COALESCE(m.role,'')
+FROM memberships m JOIN people pe ON pe.id = m.person_id
+WHERE m.project_id = $project_id
+ORDER BY pe.name;
+SQL
+    ) | column -ts $'\t'
+  else
+    (
+      echo -e "PERSON_ID\tNAME\tINITIALS\tUSERNAME\tEMAIL\tPROJECTS"
+      cache_db <<SQL
+.mode tabs
+.headers off
+SELECT pe.id, COALESCE(pe.name,''), COALESCE(pe.initials,''), COALESCE(pe.username,''), COALESCE(pe.email,''),
+       (SELECT COUNT(*) FROM memberships m WHERE m.person_id = pe.id)
+FROM people pe
+ORDER BY pe.name;
+SQL
+    ) | column -ts $'\t'
+  fi
+}
+
 cmd_cache_clear() {
   check_cache_deps
   [[ -f "$CACHE_DB" ]] || die "No cache to clear."
@@ -1473,10 +1622,14 @@ cmd_cache_clear() {
   require_int "$project_id" "project_id"
   read -rp "Drop cached rows for project $project_id? [y/N] " ans
   [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; return; }
+  # FK ON DELETE CASCADE doesn't fire here (foreign_keys pragma is per-
+  # connection and off on this one), so delete dependent rows explicitly.
+  # People rows are global and left intact; other projects may reference them.
   cache_db <<SQL
-DELETE FROM sync_log WHERE project_id = $project_id;
-DELETE FROM stories  WHERE project_id = $project_id;
-DELETE FROM projects WHERE id = $project_id;
+DELETE FROM sync_log     WHERE project_id = $project_id;
+DELETE FROM memberships  WHERE project_id = $project_id;
+DELETE FROM stories      WHERE project_id = $project_id;
+DELETE FROM projects     WHERE id = $project_id;
 SQL
   echo "Cleared project $project_id from cache."
 }
@@ -1499,6 +1652,7 @@ Commands:
   auth                                          Configure API token
   me                                            Show current user details
   projects                                      List all projects
+  members <project_id>                          List project members (users) and roles
   stories <project_id> [flags]                  List stories in a project (default: first 50)
   story show <project_id> <story_id>            Show story details
   story create <project_id> [flags]             Create a new story
@@ -1509,6 +1663,7 @@ Commands:
   schema [endpoint]                               Show API endpoint details
   cache sync <project_id>... [flags]            Sync project(s) into local SQLite cache
   cache stories <project_id> [flags]            Query stories from local cache (no API calls)
+  cache members [<project_id>]                  List cached members (one project, or all users)
   cache stats [<project_id>]                    Show cache stats and recent sync history
   cache clear [<project_id>]                    Drop cached rows (whole DB or one project)
   help                                          Show this help
@@ -1577,6 +1732,9 @@ Cache Sync Flags:
   --full                 Drop the project's cached rows before re-syncing.
   --with-descriptions    Also fetch /stories/{id} for changed stories.
   --with-comments        Also fetch /stories/{id}/comments for changed stories.
+  --with-members         Also fetch /projects/{id}/memberships and cache the
+                         project's users (people + roles). One cheap request
+                         per project; view later with 'lt cache members'.
   --start-page N         Resume paging from page N (1-indexed). Single project,
                          requires the default unfiltered pagination (no
                          --active/--state/--filter), incompatible with --full.
@@ -1624,6 +1782,7 @@ main() {
     auth)     cmd_auth "$@" ;;
     me)       load_token; cmd_me "$@" ;;
     projects) load_token; cmd_projects "$@" ;;
+    members)  load_token; cmd_members "$@" ;;
     stories)  load_token; cmd_stories "$@" ;;
     story)
       load_token
@@ -1646,9 +1805,10 @@ main() {
       case "$action" in
         sync)    load_token; cmd_cache_sync "$@" ;;
         stories) cmd_cache_stories "$@" ;;
+        members) cmd_cache_members "$@" ;;
         stats)   cmd_cache_stats "$@" ;;
         clear)   cmd_cache_clear "$@" ;;
-        *)       die "Unknown cache action: $action. Use: sync, stories, stats, clear" ;;
+        *)       die "Unknown cache action: $action. Use: sync, stories, members, stats, clear" ;;
       esac
       ;;
     help|-h|--help) cmd_help ;;
