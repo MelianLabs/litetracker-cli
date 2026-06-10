@@ -1001,7 +1001,7 @@ LIST
 
 cmd_cache_sync() {
   check_cache_deps
-  local with_descriptions=0 with_comments=0 with_members=0 full=0 quiet=0 start_offset=0
+  local with_descriptions=0 with_comments=0 with_members=0 members_only=0 full=0 quiet=0 start_offset=0
   # Default: full unfiltered pagination — works on every project. The
   # server-side filter DSL (used by --active, --state, etc.) is much faster
   # when it works, but on large/legacy projects the filtered endpoint times
@@ -1014,6 +1014,7 @@ cmd_cache_sync() {
       --with-descriptions) with_descriptions=1; shift ;;
       --with-comments)     with_comments=1; shift ;;
       --with-members)      with_members=1; shift ;;
+      --members-only)      members_only=1; with_members=1; shift ;;
       --full)              full=1; shift ;;
       --quiet)             quiet=1; shift ;;
       --active)            active=1; shift ;;
@@ -1039,6 +1040,12 @@ cmd_cache_sync() {
     esac
   done
   [[ ${#project_ids[@]} -gt 0 ]] || die "Usage: lt cache sync <project_id>... [flags]  (see 'lt help')"
+
+  if [[ "$members_only" -eq 1 ]]; then
+    if [[ "$with_descriptions" -eq 1 || "$with_comments" -eq 1 || "$full" -eq 1 || "$active" -eq 1 || "$start_offset" -gt 0 || -n "$state$exclude_state$type$label$raw_filter" ]]; then
+      die "--members-only fetches only memberships; it can't be combined with story-sync flags (--full, --with-descriptions, --with-comments, --active, --state, --exclude-state, --type, --label, --filter, --start-page, --start-offset)"
+    fi
+  fi
 
   if [[ "$start_offset" -gt 0 && "$full" -eq 1 ]]; then
     die "--start-page/--start-offset cannot be combined with --full (resume only makes sense against an existing cache)"
@@ -1067,14 +1074,14 @@ cmd_cache_sync() {
   local pid
   for pid in "${project_ids[@]}"; do
     require_int "$pid" "project_id"
-    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$with_members" "$quiet" "$start_offset" "$active" "${sweeps[@]}"
+    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$with_members" "$members_only" "$quiet" "$start_offset" "$active" "${sweeps[@]}"
   done
 }
 
 cache_sync_one_project() {
-  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" with_members="$5" quiet="$6" start_offset="${7:-0}"
-  local active="$8"
-  shift 8
+  local project_id="$1" full="$2" with_descriptions="$3" with_comments="$4" with_members="$5" members_only="$6" quiet="$7" start_offset="${8:-0}"
+  local active="$9"
+  shift 9
   local -a sweeps=("$@")
 
   local started_at finished_at status="ok" error=""
@@ -1088,6 +1095,14 @@ cache_sync_one_project() {
   projects_json=$(api_get "/projects")
   title=$(echo "$projects_json" | jq -r --argjson pid "$project_id" '.[] | select(.id == $pid) | .title // empty' | head -1)
   cache_upsert_project "$project_id" "$title" "$projects_json"
+
+  # Members-only: refresh the project's users and stop — no story pagination,
+  # no sync_log row, and last_synced_at is left alone (it tracks story syncs).
+  if [[ "$members_only" -eq 1 ]]; then
+    members_fetched=$(cache_sync_members "$project_id" "$quiet")
+    echo "[$project_id] done: members: $members_fetched (members-only)"
+    return
+  fi
 
   if [[ "$full" -eq 1 ]]; then
     [[ "$quiet" -eq 1 ]] || echo "[$project_id] --full: dropping local rows"
@@ -1735,6 +1750,10 @@ Cache Sync Flags:
   --with-members         Also fetch /projects/{id}/memberships and cache the
                          project's users (people + roles). One cheap request
                          per project; view later with 'lt cache members'.
+  --members-only         Cache ONLY the project's members — skip the story
+                         sweep entirely. One request per project. Can't be
+                         combined with story-sync flags. Leaves stories and
+                         last_synced_at untouched.
   --start-page N         Resume paging from page N (1-indexed). Single project,
                          requires the default unfiltered pagination (no
                          --active/--state/--filter), incompatible with --full.
