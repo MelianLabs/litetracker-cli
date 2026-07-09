@@ -72,8 +72,12 @@ lt stories <project_id> --offset 50 --limit 50
 # Show story details
 lt story show <project_id> <story_id>
 
-# Create a story
+# Create a story (lands in the backlog by default — the CLI sends
+# current_state=unstarted so new stories don't sink to the bottom of the icebox)
 lt story create <project_id> --name "Build login page" --type feature --estimate 3 --label "frontend"
+
+# File into the icebox instead
+lt story create <project_id> --name "Someday idea" --state unscheduled
 
 # Create a story with description
 lt story create <project_id> --name "Fix bug" --type bug --description "Steps to reproduce..."

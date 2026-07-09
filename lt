@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -561,7 +561,7 @@ cmd_story_show() {
 cmd_story_create() {
   local project_id="${1:?Usage: lt story create <project_id> --name \"...\"}"
   shift
-  local name="" story_type="feature" estimate="" label="" description="" owner_ids=""
+  local name="" story_type="feature" estimate="" label="" description="" owner_ids="" state="unstarted"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name)        name="${2:?--name requires a value}"; shift 2 ;;
@@ -570,13 +570,17 @@ cmd_story_create() {
       --label)       label="${2:?--label requires a value}"; shift 2 ;;
       --description) description="${2:?--description requires a value}"; shift 2 ;;
       --owner-ids)   owner_ids="${2:?--owner-ids requires a value}"; shift 2 ;;
+      --state)       state="${2:?--state requires a value}"; shift 2 ;;
       *)             die "Unknown flag: $1" ;;
     esac
   done
   [[ -n "$name" ]] || die "--name is required"
 
+  # Default to unstarted (backlog) — the API's own default is unscheduled,
+  # which buries new stories at the bottom of the icebox. Verified the API
+  # accepts current_state on create, even for unestimated features.
   local json
-  json=$(jq -n --arg name "$name" --arg type "$story_type" '{name: $name, story_type: $type}')
+  json=$(jq -n --arg name "$name" --arg type "$story_type" --arg state "$state" '{name: $name, story_type: $type, current_state: $state}')
   [[ -n "$estimate" ]] && json=$(echo "$json" | jq --argjson est "$estimate" '. + {estimate: $est}')
   [[ -n "$label" ]] && json=$(echo "$json" | jq --arg lbl "$label" '. + {labels: [{name: $lbl}]}')
   [[ -n "$description" ]] && json=$(echo "$json" | jq --arg desc "$description" '. + {description: $desc}')
@@ -871,11 +875,13 @@ LIST
             estimate: {type: "integer", required: false, description: "Point estimate"},
             description: {type: "string", required: false, description: "Story description"},
             labels: {type: "array", required: false, description: "Array of label objects, e.g. [{\"name\": \"urgent\"}]"},
-            owner_ids: {type: "array", required: false, description: "CLI-only convenience (--owner-ids). The API ignores owners on create, so the CLI assigns them via a follow-up update — not a real create-endpoint field."}
+            owner_ids: {type: "array", required: false, description: "CLI-only convenience (--owner-ids). The API ignores owners on create, so the CLI assigns them via a follow-up update — not a real create-endpoint field."},
+            current_state: {type: "string", required: false, description: "Initial state: unscheduled (icebox) or unstarted (backlog). Accepted on create, even for unestimated features."}
           }
         },
         notes: [
-          "The API itself ignores owner_ids on create. The lt CLI accepts --owner-ids and fires a follow-up story update to assign owners; a direct API call must use story update."
+          "The API itself ignores owner_ids on create. The lt CLI accepts --owner-ids and fires a follow-up story update to assign owners; a direct API call must use story update.",
+          "The API defaults current_state to unscheduled (bottom of the icebox). The lt CLI sends unstarted (backlog) by default so new stories stay visible; pass --state unscheduled to file into the icebox."
         ],
         response: {
           properties: {
@@ -1714,6 +1720,8 @@ Story Create Flags:
   --owner-ids N,...    Comma-separated user IDs to assign as owners. The API
                        ignores owners on create, so this fires a follow-up
                        update automatically.
+  --state STATE        Initial state (default: unstarted = backlog; use
+                       unscheduled to file into the icebox)
 
 Story Update Flags:
   --state STATE      State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted
