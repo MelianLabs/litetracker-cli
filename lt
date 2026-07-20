@@ -1484,6 +1484,118 @@ SQL
   fi
 }
 
+# Targeted "poor man's sync": pull specific stories (by id) or a filtered set
+# from the API and write them through to the cache in one transaction — far
+# cheaper than a full 'lt cache sync' when only a handful of stories matter.
+# Two mutually-exclusive modes:
+#   lt cache reconcile <pid> <id> [<id>...]           # by id (parallel fetch)
+#   lt cache reconcile <pid> --label p1 [more flags]  # by server-side filter
+# Filter flags mirror 'lt stories': --state/--exclude-state/--type/--label/
+# --filter/--active. Reconcile only refreshes stories it is told about; it
+# cannot discover stories that silently changed and are neither named nor
+# matched by the filter — for that, run a full 'lt cache sync'.
+# Force every story in the given page JSON to be treated as "changed" by the
+# next cache_sync_page, so its state/owners/labels are rewritten even when LT
+# left updated_at untouched (owner-only edits don't bump it). Nulls the cached
+# updated_at for those ids; rows missing from the cache are unaffected (they
+# insert normally).
+force_refresh_ids() {
+  local page_json="$1" idlist
+  idlist=$(echo "$page_json" | jq -r '[.[].id] | join(",")')
+  [[ -n "$idlist" ]] || return 0
+  cache_db "UPDATE stories SET updated_at = NULL WHERE id IN ($idlist);" 2>/dev/null || true
+}
+
+cmd_cache_reconcile() {
+  check_cache_deps
+  local project_id="${1:?Usage: lt cache reconcile <project_id> <story_id...> | <project_id> --label <name> [filters]}"
+  shift
+  require_int "$project_id" "project_id"
+
+  local -a ids=()
+  local state="" exclude_state="" type="" label="" raw_filter="" active=0
+  local maxjobs="${LT_RECONCILE_JOBS:-8}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --active)        active=1; shift ;;
+      --state)         state="${2:?--state requires a value}"; require_state "$state" "--state"; shift 2 ;;
+      --exclude-state) exclude_state="${2:?--exclude-state requires a value}"; require_state "$exclude_state" "--exclude-state"; shift 2 ;;
+      --type)          type="${2:?--type requires a value}"; require_story_type "$type" "--type"; shift 2 ;;
+      --label)         label="${2:?--label requires a value}"; shift 2 ;;
+      --filter)        raw_filter="${2:?--filter requires a value}"; shift 2 ;;
+      -*)              die "Unknown flag: $1" ;;
+      *)               require_int "$1" "story_id"; ids+=("$1"); shift ;;
+    esac
+  done
+
+  [[ -f "$CACHE_DB" ]] || die "No cache found. Run 'lt cache sync $project_id' first."
+
+  local have_filter=0
+  [[ "$active" -eq 1 || -n "$state$exclude_state$type$label$raw_filter" ]] && have_filter=1
+  if [[ "${#ids[@]}" -gt 0 && "$have_filter" -eq 1 ]]; then
+    die "Provide either story ids OR filter flags, not both."
+  fi
+  if [[ "${#ids[@]}" -eq 0 && "$have_filter" -eq 0 ]]; then
+    die "Nothing to reconcile: pass story ids or a filter (--label/--state/--type/--exclude-state/--filter/--active)."
+  fi
+
+  # Ensure the project row exists — stories.project_id references it.
+  local projects_json title
+  projects_json=$(api_get "/projects")
+  title=$(echo "$projects_json" | jq -r --argjson pid "$project_id" '.[] | select(.id == $pid) | .title // empty' | head -1)
+  cache_upsert_project "$project_id" "$title" "$projects_json"
+
+  local ins=0 upd=0 unc=0 pages=0 skipped=0 page count
+
+  if [[ "$have_filter" -eq 1 ]]; then
+    local resolved server_filter client_type client_label
+    resolved=$(resolve_filters "$active" "$state" "$exclude_state" "$type" "$label" "$raw_filter")
+    server_filter=$(echo "$resolved" | awk '/^server_filter=/ {sub(/^server_filter=/,""); print}')
+    client_type=$(  echo "$resolved" | awk '/^client_type=/   {sub(/^client_type=/,"");   print}')
+    client_label=$( echo "$resolved" | awk '/^client_label=/  {sub(/^client_label=/,"");  print}')
+    local -a sweeps=()
+    if [[ "$active" -eq 1 ]]; then
+      local s; for s in "${ACTIVE_STATES[@]}"; do sweeps+=("state:$s"); done
+    else
+      sweeps=("$server_filter")
+    fi
+    local all_data="[]" sweep
+    for sweep in "${sweeps[@]}"; do
+      page=$(fetch_stories_list "/projects/$project_id/stories" "$sweep" 1 "" "")
+      all_data=$(jq -s 'add' <(echo "$all_data") <(echo "$page"))
+    done
+    [[ -n "$client_type" ]]  && all_data=$(echo "$all_data" | jq --arg t "$client_type"  '[.[] | select(.story_type == $t)]')
+    [[ -n "$client_label" ]] && all_data=$(echo "$all_data" | jq --arg l "$client_label" '[.[] | select(.labels[]?.name == $l)]')
+    count=$(echo "$all_data" | jq 'length')
+    if [[ "$count" -gt 0 ]]; then
+      force_refresh_ids "$all_data"
+      apply_page_to_cache "$project_id" "$all_data" 1 0 ins upd unc pages
+    fi
+    echo "[$project_id] reconciled (filter): matched $count -> +${ins} new, ~${upd} refreshed"
+    return
+  fi
+
+  # By-id mode: fetch each story in parallel. Each api_get runs in a subshell,
+  # so its die-on-4xx (e.g. a 404 for an id not in this project) exits only the
+  # subshell and just leaves no temp file — that id is counted as skipped.
+  local tmpd id
+  tmpd=$(mktemp -d)
+  for id in "${ids[@]}"; do
+    ( api_get "/projects/$project_id/stories/$id" >"$tmpd/$id.json" 2>/dev/null || rm -f "$tmpd/$id.json" ) &
+    while (( $(jobs -rp | wc -l) >= maxjobs )); do wait -n; done
+  done
+  wait
+  page=$(cat "$tmpd"/*.json 2>/dev/null | jq -s '[ .[] | select(type == "object" and has("id")) ]')
+  rm -rf "$tmpd"
+  count=$(echo "$page" | jq 'length')
+  skipped=$(( ${#ids[@]} - count ))
+  if [[ "$count" -gt 0 ]]; then
+    force_refresh_ids "$page"
+    apply_page_to_cache "$project_id" "$page" 1 0 ins upd unc pages
+  fi
+  echo "[$project_id] reconciled (${#ids[@]} ids): +${ins} new, ~${upd} refreshed, ${skipped} skipped (404/not in project)"
+}
+
 cmd_cache_stories() {
   check_cache_deps
   local project_id="${1:?Usage: lt cache stories <project_id> [flags]  (see 'lt help')}"
@@ -1683,6 +1795,7 @@ Commands:
   story comment <project_id> <story_id> [flags]   Add a comment
   schema [endpoint]                               Show API endpoint details
   cache sync <project_id>... [flags]            Sync project(s) into local SQLite cache
+  cache reconcile <project_id> <id>... | [filters]  Refresh specific/filtered stories into the cache
   cache stories <project_id> [flags]            Query stories from local cache (no API calls)
   cache members [<project_id>]                  List cached members (one project, or all users)
   cache stats [<project_id>]                    Show cache stats and recent sync history
@@ -1771,6 +1884,25 @@ Cache Sync Flags:
   GET requests retry on 5xx / network errors with exponential backoff
   (5 attempts: 1s, 2s, 4s, 8s, 16s). Override with LT_API_MAX_ATTEMPTS=N.
 
+Cache Reconcile (targeted "poor man's sync"):
+  A cheap alternative to a full 'cache sync' when only a few stories matter:
+  pull them live and write them through to the cache in one transaction.
+  Two mutually-exclusive modes:
+    lt cache reconcile <pid> <id> [<id>...]   By id — fetched in parallel
+                                              (LT_RECONCILE_JOBS, default 8);
+                                              ids not in the project are skipped.
+    lt cache reconcile <pid> [filters]        By server-side filter — same flags
+                                              as 'lt stories': --state,
+                                              --exclude-state, --type, --label,
+                                              --filter, --active.
+  Inserts stories missing from the cache and force-refreshes the rest (state,
+  owners, labels — even when LT left updated_at untouched, e.g. owner-only
+  edits). Only touches stories you name or match — it can't discover stories
+  that silently changed; use 'cache sync' for a full refresh.
+  NOTE: filter mode uses the server-side filter DSL, which 504s on large/legacy
+  projects (e.g. 254). There, discover candidate ids from the cache
+  ('lt cache stories 254 --label ...' style) and reconcile them BY ID instead.
+
 Cache Stories Flags:
   --active               State IN (unstarted, planned, started, finished,
                          delivered, rejected) — mirrors the sync default.
@@ -1830,12 +1962,13 @@ main() {
       local action="${1:-help}"
       shift || true
       case "$action" in
-        sync)    load_token; cmd_cache_sync "$@" ;;
-        stories) cmd_cache_stories "$@" ;;
-        members) cmd_cache_members "$@" ;;
-        stats)   cmd_cache_stats "$@" ;;
-        clear)   cmd_cache_clear "$@" ;;
-        *)       die "Unknown cache action: $action. Use: sync, stories, members, stats, clear" ;;
+        sync)      load_token; cmd_cache_sync "$@" ;;
+        reconcile) load_token; cmd_cache_reconcile "$@" ;;
+        stories)   cmd_cache_stories "$@" ;;
+        members)   cmd_cache_members "$@" ;;
+        stats)     cmd_cache_stats "$@" ;;
+        clear)     cmd_cache_clear "$@" ;;
+        *)         die "Unknown cache action: $action. Use: sync, reconcile, stories, members, stats, clear" ;;
       esac
       ;;
     help|-h|--help) cmd_help ;;

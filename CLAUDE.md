@@ -43,6 +43,9 @@ No test framework. Test manually:
 ./lt stories <id>      # requires auth + valid project
 ```
 
+- **Cache write-through:** `lt story show/create/update` call `cache_writethrough_story`, which runs the fetched JSON through `cache_sync_page` — so any single-story API read/write self-heals that story's cache row (state, owners, labels, description). Prefer these over raw `curl` when you want the cache to stay fresh.
+- **`lt cache reconcile <pid> <id>... | <pid> [filters]`** — targeted "poor man's sync": pull specific stories (by id, fetched in parallel via `LT_RECONCILE_JOBS`, default 8; each `api_get` in a subshell so a 404 skips that id instead of aborting) or a filtered set (`--state/--exclude-state/--type/--label/--filter/--active`, reusing `resolve_filters`/`fetch_stories_list`), then write them through in ONE `cache_sync_page` transaction. Unlike `cache sync`, it **force-refreshes** every reconciled story via `force_refresh_ids` (nulls the cached `updated_at` so the diff treats them as changed) — necessary because LT does NOT bump `updated_at` on owner-only edits, so a plain sync would leave stale owners/labels. Modes are mutually exclusive (ids XOR filters). **Filter mode 504s on large/legacy projects (254)** like every `filter=` clause; there, derive candidate ids from the cache and reconcile BY ID (which uses per-story GETs that don't 504). By-id is the workhorse for 254.
+
 ## API Reference
 
 LiteTracker REST API v5 docs: https://help.litetracker.com/api/rest/v5.html
