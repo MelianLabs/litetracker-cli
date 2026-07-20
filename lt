@@ -252,6 +252,22 @@ CREATE TABLE IF NOT EXISTS sync_log (
   error                TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sync_log_project ON sync_log(project_id);
+
+-- Resumable-sync checkpoint: one row per project, updated after every page of
+-- an unfiltered sync. Lets a crashed/timed-out sync resume from next_offset
+-- instead of restarting, and records where it stalled and why.
+CREATE TABLE IF NOT EXISTS sync_progress (
+  project_id   INTEGER PRIMARY KEY,
+  mode         TEXT,     -- 'unfiltered' (only unfiltered pagination is resumable)
+  page_size    INTEGER,
+  next_offset  INTEGER,  -- offset to fetch next; resume point
+  pages_done   INTEGER,
+  stories_seen INTEGER,
+  status       TEXT,     -- in_progress | complete | failed
+  last_error   TEXT,
+  started_at   TEXT,
+  updated_at   TEXT
+);
 SQL
 }
 
@@ -263,7 +279,12 @@ cache_init() {
 }
 
 cache_db() {
-  sqlite3 -bail "$CACHE_DB" "$@"
+  # -init /dev/null: ignore ~/.sqliterc — a user rc with `.headers on` / `.mode
+  # column` (or a `.load` extension) otherwise pollutes single-value reads with
+  # header/separator lines and breaks parsing. -noheader -list forces clean,
+  # pipe-separated output; heredoc SQL that needs another mode sets its own
+  # `.mode`/`.headers`, which override these flags.
+  sqlite3 -init /dev/null -batch -noheader -list -bail "$CACHE_DB" "$@"
 }
 
 # Validate that an argument is a non-negative integer; die otherwise.
@@ -1077,11 +1098,31 @@ cmd_cache_sync() {
 
   cache_init
 
-  local pid
+  local pid overall_rc=0
   for pid in "${project_ids[@]}"; do
     require_int "$pid" "project_id"
-    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$with_members" "$members_only" "$quiet" "$start_offset" "$active" "${sweeps[@]}"
+    cache_sync_one_project "$pid" "$full" "$with_descriptions" "$with_comments" "$with_members" "$members_only" "$quiet" "$start_offset" "$active" "${sweeps[@]}" || overall_rc=1
   done
+  return "$overall_rc"
+}
+
+# Upsert the resumable-sync checkpoint for a project (one row, keyed by id).
+# Args: pid mode page_size next_offset pages_done stories_seen status started_at [last_error]
+cache_progress_set() {
+  local pid="$1" mode="$2" psize="$3" noff="$4" pdone="$5" sseen="$6" st="$7" started="$8" err="${9:-}"
+  local now; now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cache_db "INSERT INTO sync_progress(project_id,mode,page_size,next_offset,pages_done,stories_seen,status,last_error,started_at,updated_at)
+  VALUES ($pid,$(sql_lit "$mode"),$psize,$noff,$pdone,$sseen,$(sql_lit "$st"),$(sql_lit "$err"),$(sql_lit "$started"),$(sql_lit "$now"))
+  ON CONFLICT(project_id) DO UPDATE SET mode=excluded.mode,page_size=excluded.page_size,next_offset=excluded.next_offset,
+    pages_done=excluded.pages_done,stories_seen=excluded.stories_seen,status=excluded.status,
+    last_error=excluded.last_error,started_at=excluded.started_at,updated_at=excluded.updated_at;"
+}
+
+# Echo "next_offset|pages_done|started_at" for a resumable (in_progress/failed)
+# unfiltered checkpoint, or nothing if there's none to resume.
+cache_progress_resume() {
+  cache_db "SELECT next_offset||'|'||pages_done||'|'||started_at FROM sync_progress
+  WHERE project_id=$1 AND mode='unfiltered' AND status IN ('in_progress','failed');"
 }
 
 cache_sync_one_project() {
@@ -1125,66 +1166,91 @@ cache_sync_one_project() {
   fi
   [[ "$quiet" -eq 1 ]] || echo "[$project_id] syncing /projects/$project_id/stories ($mode_label)"
 
-  # When there's no filter (e.g. --all-states or raw --filter that resolved
-  # to empty), we want pagination so we can keep STORIES_PAGE_SIZE small AND
-  # support resume via --start-offset. fetch_stories_list handles that
-  # internally. When a filter IS present, the server returns everything in
-  # one shot (it ignores offset for filtered queries).
-  #
-  # For a filtered sweep we set fetch_all=1 but fetch_stories_list short-
-  # circuits to a single request. For an unfiltered sweep we honor
-  # start_offset on the FIRST sweep only — subsequent sweeps would only
-  # exist if active mode were on, which always has a filter.
-  local sweep page count
-  for sweep in "${sweeps[@]}"; do
-    [[ "$active" -eq 1 && "$quiet" -ne 1 ]] && echo "[$project_id]  -> sweep ${sweep}"
-    [[ "${LT_DEBUG:-0}" == "1" ]] && printf "[lt-debug] cache sync sweep: filter=%s\n" "${sweep:-<none>}" >&2
-
-    if [[ -z "$sweep" && "$start_offset" -gt 0 ]]; then
-      # Resume: paginate manually from start_offset for the first sweep only.
-      local cur_offset=$start_offset
-      while :; do
-        local qs
-        qs=$(build_qs "" "$cur_offset" "$STORIES_PAGE_SIZE")
-        page=$(api_get "/projects/$project_id/stories${qs}")
-        count=$(echo "$page" | jq 'length')
-        if [[ "$count" -gt 0 ]]; then
-          apply_page_to_cache "$project_id" "$page" "$quiet" "$cur_offset" stories_inserted stories_updated stories_unchanged pages_fetched
-        fi
-        [[ "$count" -lt "$STORIES_PAGE_SIZE" ]] && break
-        cur_offset=$((cur_offset + STORIES_PAGE_SIZE))
-      done
-      start_offset=0
-      continue
+  local page count
+  if [[ "$active" -eq 0 && "${#sweeps[@]}" -eq 1 && -z "${sweeps[0]}" ]]; then
+    # UNFILTERED: resumable page-by-page pagination with a sync_progress
+    # checkpoint after every page. This (a) never accumulates the whole result
+    # set in memory — the old fetch_all path OOM'd/segfaulted on large projects
+    # like 254 — and (b) survives a 504/crash: re-running resumes from where it
+    # stopped instead of restarting the whole ~19k-row sync.
+    local cur_offset="$start_offset" sync_started="$started_at" resume_info
+    if [[ "$full" -eq 1 ]]; then
+      cache_db "DELETE FROM sync_progress WHERE project_id = $project_id;"
+    elif [[ "$start_offset" -eq 0 ]]; then
+      resume_info=$(cache_progress_resume "$project_id")
+      if [[ -n "$resume_info" ]]; then
+        cur_offset=${resume_info%%|*}
+        local _rest=${resume_info#*|}; pages_fetched=${_rest%%|*}
+        sync_started=${resume_info##*|}
+        [[ "$quiet" -eq 1 ]] || echo "[$project_id] resuming unfiltered sync from offset $cur_offset (page size $STORIES_PAGE_SIZE, $pages_fetched pages already done)"
+      fi
     fi
 
-    page=$(fetch_stories_list "/projects/$project_id/stories" "$sweep" 1 "" "")
-    count=$(echo "$page" | jq 'length')
-    if [[ "$count" -gt 0 ]]; then
-      apply_page_to_cache "$project_id" "$page" "$quiet" 0 stories_inserted stories_updated stories_unchanged pages_fetched
+    while :; do
+      local qs; qs=$(build_qs "" "$cur_offset" "$STORIES_PAGE_SIZE")
+      if ! page=$(api_get "/projects/$project_id/stories${qs}"); then
+        cache_progress_set "$project_id" unfiltered "$STORIES_PAGE_SIZE" "$cur_offset" "$pages_fetched" \
+          "$((stories_inserted + stories_updated + stories_unchanged))" failed "$sync_started" "API fetch failed at offset $cur_offset"
+        status="failed"; error="fetch failed at offset $cur_offset"
+        echo "[$project_id] sync FAILED at offset $cur_offset — progress saved; re-run 'lt cache sync $project_id' to resume from there." >&2
+        break
+      fi
+      count=$(echo "$page" | jq 'length')
+      if [[ "$count" -gt 0 ]]; then
+        apply_page_to_cache "$project_id" "$page" "$quiet" "$cur_offset" stories_inserted stories_updated stories_unchanged pages_fetched
+      fi
+      cur_offset=$((cur_offset + STORIES_PAGE_SIZE))
+      if [[ "$count" -lt "$STORIES_PAGE_SIZE" ]]; then
+        cache_progress_set "$project_id" unfiltered "$STORIES_PAGE_SIZE" "$cur_offset" "$pages_fetched" \
+          "$((stories_inserted + stories_updated + stories_unchanged))" complete "$sync_started" ""
+        break
+      fi
+      cache_progress_set "$project_id" unfiltered "$STORIES_PAGE_SIZE" "$cur_offset" "$pages_fetched" \
+        "$((stories_inserted + stories_updated + stories_unchanged))" in_progress "$sync_started" ""
+    done
+  else
+    # FILTERED / ACTIVE: one request per sweep. The server returns all matching
+    # rows in a single response (it ignores offset on filtered queries), so
+    # there's no pagination and no whole-array accumulation to blow up.
+    local sweep
+    for sweep in "${sweeps[@]}"; do
+      [[ "$active" -eq 1 && "$quiet" -ne 1 ]] && echo "[$project_id]  -> sweep ${sweep}"
+      [[ "${LT_DEBUG:-0}" == "1" ]] && printf "[lt-debug] cache sync sweep: filter=%s\n" "${sweep:-<none>}" >&2
+      page=$(fetch_stories_list "/projects/$project_id/stories" "$sweep" 1 "" "")
+      count=$(echo "$page" | jq 'length')
+      if [[ "$count" -gt 0 ]]; then
+        apply_page_to_cache "$project_id" "$page" "$quiet" 0 stories_inserted stories_updated stories_unchanged pages_fetched
+      fi
+    done
+  fi
+
+  # Skip the opt-in extras when the story sync itself failed — they'd operate on
+  # a partial cache and the run is going to be resumed anyway.
+  if [[ "$status" != "failed" ]]; then
+    if [[ "$with_descriptions" -eq 1 ]]; then
+      descriptions_fetched=$(cache_sync_descriptions "$project_id" "$quiet")
     fi
-    start_offset=0
-  done
-
-  if [[ "$with_descriptions" -eq 1 ]]; then
-    descriptions_fetched=$(cache_sync_descriptions "$project_id" "$quiet")
+    if [[ "$with_comments" -eq 1 ]]; then
+      comments_fetched=$(cache_sync_comments "$project_id" "$quiet")
+    fi
+    if [[ "$with_members" -eq 1 ]]; then
+      members_fetched=$(cache_sync_members "$project_id" "$quiet")
+    fi
+    finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    cache_db "UPDATE projects SET last_synced_at = '$finished_at' WHERE id = $project_id;"
+  else
+    finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   fi
 
-  if [[ "$with_comments" -eq 1 ]]; then
-    comments_fetched=$(cache_sync_comments "$project_id" "$quiet")
-  fi
-
-  if [[ "$with_members" -eq 1 ]]; then
-    members_fetched=$(cache_sync_members "$project_id" "$quiet")
-  fi
-
-  finished_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   cache_db <<SQL
-UPDATE projects SET last_synced_at = '$finished_at' WHERE id = $project_id;
 INSERT INTO sync_log(project_id, started_at, finished_at, pages_fetched, stories_inserted, stories_updated, stories_unchanged, comments_fetched, descriptions_fetched, status, error)
-VALUES ($project_id, '$started_at', '$finished_at', $pages_fetched, $stories_inserted, $stories_updated, $stories_unchanged, $comments_fetched, $descriptions_fetched, '$status', '$error');
+VALUES ($project_id, '$started_at', '$finished_at', $pages_fetched, $stories_inserted, $stories_updated, $stories_unchanged, $comments_fetched, $descriptions_fetched, $(sql_lit "$status"), $(sql_lit "$error"));
 SQL
 
+  if [[ "$status" == "failed" ]]; then
+    echo "[$project_id] incomplete: +${stories_inserted} new, ~${stories_updated} updated, =${stories_unchanged} unchanged so far (pages: $pages_fetched). Re-run to resume."
+    return 1
+  fi
   echo "[$project_id] done: +${stories_inserted} new, ~${stories_updated} updated, =${stories_unchanged} unchanged (pages: $pages_fetched, descriptions: $descriptions_fetched, comments: $comments_fetched, members: $members_fetched)"
 }
 
@@ -1702,6 +1768,29 @@ ORDER BY id DESC
 LIMIT 10;
 SQL
   ) | column -ts $'\t'
+
+  # Surface any unfiltered sync that stopped mid-way (crash / 504) so it's
+  # obvious a re-run will resume rather than restart.
+  local pw=${where//p.id/project_id} pclause
+  if [[ -n "$pw" ]]; then pclause="$pw AND status IN ('in_progress','failed')"; else pclause="WHERE status IN ('in_progress','failed')"; fi
+  local interrupted
+  interrupted=$(cache_db "SELECT COUNT(*) FROM sync_progress $pclause;" 2>/dev/null || echo 0)
+  if [[ "${interrupted:-0}" -gt 0 ]]; then
+    echo
+    echo "Interrupted syncs (re-run 'lt cache sync <project_id>' to resume):"
+    (
+      echo -e "PROJECT\tSTATUS\tNEXT_OFFSET\tPAGES_DONE\tUPDATED\tLAST_ERROR"
+      cache_db <<SQL
+.mode tabs
+.headers off
+SELECT project_id, status, next_offset, pages_done, updated_at, COALESCE(last_error,'')
+FROM sync_progress
+$pclause
+ORDER BY project_id;
+SQL
+    ) | column -ts $'\t'
+  fi
+
   echo
   echo "Note: rows reflect each sync — stories deleted in LT after their first sync may persist locally until 'lt cache sync --full'."
 }
@@ -1759,10 +1848,11 @@ cmd_cache_clear() {
   # connection and off on this one), so delete dependent rows explicitly.
   # People rows are global and left intact; other projects may reference them.
   cache_db <<SQL
-DELETE FROM sync_log     WHERE project_id = $project_id;
-DELETE FROM memberships  WHERE project_id = $project_id;
-DELETE FROM stories      WHERE project_id = $project_id;
-DELETE FROM projects     WHERE id = $project_id;
+DELETE FROM sync_log      WHERE project_id = $project_id;
+DELETE FROM sync_progress WHERE project_id = $project_id;
+DELETE FROM memberships   WHERE project_id = $project_id;
+DELETE FROM stories       WHERE project_id = $project_id;
+DELETE FROM projects      WHERE id = $project_id;
 SQL
   echo "Cleared project $project_id from cache."
 }
@@ -1883,6 +1973,14 @@ Cache Sync Flags:
 
   GET requests retry on 5xx / network errors with exponential backoff
   (5 attempts: 1s, 2s, 4s, 8s, 16s). Override with LT_API_MAX_ATTEMPTS=N.
+
+  Resumable: an unfiltered sync applies one page at a time and checkpoints its
+  offset to the sync_progress table after every page (never accumulates the
+  whole result set — that OOM'd/segfaulted on large projects like 254). If it
+  crashes or a page 504s past the retry budget, progress is saved and the run
+  exits non-zero; just re-run `lt cache sync <id>` and it RESUMES from where it
+  stopped. `--full` restarts from scratch (clears the checkpoint). `lt cache
+  stats` shows any interrupted sync. Set page size via LT_STORIES_PAGE_SIZE.
 
 Cache Reconcile (targeted "poor man's sync"):
   A cheap alternative to a full 'cache sync' when only a few stories matter:
