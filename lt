@@ -582,13 +582,14 @@ cmd_story_show() {
 cmd_story_create() {
   local project_id="${1:?Usage: lt story create <project_id> --name \"...\"}"
   shift
-  local name="" story_type="feature" estimate="" label="" description="" owner_ids="" state="unstarted"
+  local name="" story_type="feature" estimate="" description="" owner_ids="" state="unstarted"
+  local -a labels=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name)        name="${2:?--name requires a value}"; shift 2 ;;
       --type)        story_type="${2:?--type requires a value}"; shift 2 ;;
       --estimate)    estimate="${2:?--estimate requires a value}"; shift 2 ;;
-      --label)       label="${2:?--label requires a value}"; shift 2 ;;
+      --label)       labels+=("${2:?--label requires a value}"); shift 2 ;;
       --description) description="${2:?--description requires a value}"; shift 2 ;;
       --owner-ids)   owner_ids="${2:?--owner-ids requires a value}"; shift 2 ;;
       --state)       state="${2:?--state requires a value}"; shift 2 ;;
@@ -603,7 +604,13 @@ cmd_story_create() {
   local json
   json=$(jq -n --arg name "$name" --arg type "$story_type" --arg state "$state" '{name: $name, story_type: $type, current_state: $state}')
   [[ -n "$estimate" ]] && json=$(echo "$json" | jq --argjson est "$estimate" '. + {estimate: $est}')
-  [[ -n "$label" ]] && json=$(echo "$json" | jq --arg lbl "$label" '. + {labels: [{name: $lbl}]}')
+  if [[ ${#labels[@]} -gt 0 ]]; then
+    # --args/$ARGS.positional keeps each label a distinct jq string, so a
+    # multi-word label like "technical debt" isn't split on its space.
+    local labels_json
+    labels_json=$(jq -n --args '[$ARGS.positional[] | {name: .}]' "${labels[@]}")
+    json=$(echo "$json" | jq --argjson lbls "$labels_json" '. + {labels: $lbls}')
+  fi
   [[ -n "$description" ]] && json=$(echo "$json" | jq --arg desc "$description" '. + {description: $desc}')
 
   local result
