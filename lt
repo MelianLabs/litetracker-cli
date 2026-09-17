@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
