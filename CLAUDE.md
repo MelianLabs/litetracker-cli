@@ -52,3 +52,11 @@ No test framework. Test manually:
 ## API Reference
 
 LiteTracker REST API v5 docs: https://help.litetracker.com/api/rest/v5.html
+
+## Label operations & write-retry policy
+
+- **`lt story label <p> <id> --label X [--remove Y]`** — add and/or remove individual labels (both flags repeatable). Adds POST to `.../labels`; removes DELETE `.../labels/{label_id}` (the id comes from the story payload's `labels[].id`). The story is read first so an already-present label is **skipped rather than re-POSTed**.
+- **`lt story labels <p> <id> --set "a,b,c"`** — REPLACES the entire label set (include every label to keep). One `PUT` with a `labels` array; large, heavily-commented stories 500 on that PUT every time, so on final failure it falls back to a per-label diff (POST adds / DELETE removes) and then verifies with a fresh GET.
+- **`lt story relabel <p> <id> --from X --to Y`** — swap one label for another using only per-label calls; adds `Y` *before* removing `X` so a mid-way failure leaves the story over- not under-labelled.
+- **Retry policy is asymmetric on purpose:** `api_get`, `api_put` and `api_delete` retry 5xx/transport errors (`LT_API_MAX_ATTEMPTS`, default 5). **`api_post` is never retried** — story/comment/label creation is not idempotent and LT can accept a POST while the client sees a 5xx, so a retry duplicates the story. A 5xx on a PUT can also **partially apply** (observed: one label dropped), so label commands re-GET and verify instead of trusting the write's response.
+- **`LT_DRY_RUN=1`** prints each write (method, URL, body) to stderr and returns `{}` without calling the API — use it to test command wiring when LT's write path is down.
