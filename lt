@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -110,37 +110,82 @@ api_get() {
   done
 }
 
-api_post() {
-  local response http_code body
-  response=$(curl -sS -w "\n%{http_code}" \
-    -X POST \
-    -H "X-TrackerToken: $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "$2" \
-    "$BASE_URL$1")
-  http_code=$(echo "$response" | tail -1)
-  body=$(echo "$response" | sed '$d')
-  if [[ "$http_code" -ge 400 ]]; then
-    die "API error ($http_code): $body"
+# --- Write helpers ---
+#
+# RETRY POLICY IS DELIBERATELY ASYMMETRIC:
+#   * api_post is NEVER retried. Creating a story, a comment or a label is not
+#     idempotent: LT can accept the POST server-side while the client only sees
+#     a 5xx or a timeout, so a blind retry files the same story twice. Fail
+#     fast and let the caller re-check server state before trying again.
+#   * api_put / api_delete retry on 5xx and transport errors exactly like
+#     api_get, because a full-resource PUT and a DELETE are idempotent —
+#     repeating them converges on the same state. 4xx is never retried.
+# A failed PUT can still have PARTIALLY applied (observed: a 500 that dropped
+# one label), so callers that care re-GET and verify rather than trusting the
+# response body.
+#
+# LT_DRY_RUN=1 prints the request to stderr and returns '{}' without calling
+# the API — for testing command wiring while LT's write path is unavailable.
+_api_write() {  # <METHOD> <path> [json-body] [retry]
+  local method="$1" path="$2" data="${3:-}" mode="${4:-noretry}"
+  local url="$BASE_URL$path"
+  local max_attempts=1 attempt=1 sleep_s=1
+  [[ "$mode" == "retry" ]] && max_attempts="${LT_API_MAX_ATTEMPTS:-5}"
+
+  if [[ "${LT_DRY_RUN:-0}" == "1" ]]; then
+    printf "[lt-dry-run] %s %s %s\n" "$method" "$url" "${data:-<no body>}" >&2
+    echo '{}'
+    return 0
   fi
-  echo "$body"
+
+  local response http_code body curl_rc
+  while :; do
+    local -a args=(-sS -w "\n%{http_code}" -X "$method" -H "X-TrackerToken: $TOKEN")
+    if [[ -n "$data" ]]; then
+      args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+    if response=$(curl "${args[@]}" "$url" 2>&1); then
+      curl_rc=0
+      http_code=$(echo "$response" | tail -1)
+      body=$(echo "$response" | sed '$d')
+    else
+      curl_rc=$?
+      http_code=0
+      body="$response"
+    fi
+
+    # Success, or a non-retryable 4xx — return / die immediately.
+    if [[ "$curl_rc" -eq 0 && "$http_code" -lt 500 ]]; then
+      if [[ "$http_code" -ge 400 ]]; then
+        die "API error ($http_code) on $method $path: $body"
+      fi
+      echo "$body"
+      return 0
+    fi
+
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      local suffix=""
+      [[ "$max_attempts" -gt 1 ]] && suffix=" after $max_attempts attempts"
+      if [[ "$curl_rc" -ne 0 ]]; then
+        die "curl failed (rc=$curl_rc) on $method $path$suffix: $body"
+      fi
+      die "API error ($http_code) on $method $path$suffix: $body"
+    fi
+
+    if [[ "$curl_rc" -ne 0 ]]; then
+      echo "Warning: curl failed (rc=$curl_rc) on $method $path, retrying in ${sleep_s}s (attempt $attempt/$max_attempts)" >&2
+    else
+      echo "Warning: $method $path returned $http_code, retrying in ${sleep_s}s (attempt $attempt/$max_attempts)" >&2
+    fi
+    sleep "$sleep_s"
+    sleep_s=$((sleep_s * 2))
+    attempt=$((attempt + 1))
+  done
 }
 
-api_put() {
-  local response http_code body
-  response=$(curl -sS -w "\n%{http_code}" \
-    -X PUT \
-    -H "X-TrackerToken: $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "$2" \
-    "$BASE_URL$1")
-  http_code=$(echo "$response" | tail -1)
-  body=$(echo "$response" | sed '$d')
-  if [[ "$http_code" -ge 400 ]]; then
-    die "API error ($http_code): $body"
-  fi
-  echo "$body"
-}
+api_post()   { _api_write POST   "$1" "$2"; }        # never retried — see policy above
+api_put()    { _api_write PUT    "$1" "$2" retry; }  # idempotent
+api_delete() { _api_write DELETE "$1" ""   retry; }  # idempotent
 
 # --- Cache (local SQLite mirror) ---
 #
@@ -668,24 +713,167 @@ cmd_story_update() {
   echo "$result" | jq '{id, title, story_type, current_state, estimate, owner_ids: [.owners[]?.user_id], url}'
 }
 
+# Current labels of a story as compact JSON [{id, name}, ...] — one GET.
+_story_labels_json() {  # <project_id> <story_id>
+  api_get "/projects/$1/stories/$2" | jq -c '[.labels[]? | {id: .id, name: .name}]'
+}
+
+# Re-read the story from the server (never trust a write's response body — a
+# 5xx can partially apply), refresh the cache, and print the label set.
+_story_labels_verify() {  # <project_id> <story_id>
+  local result
+  result=$(api_get "/projects/$1/stories/$2")
+  cache_writethrough_story "$1" "$result"
+  echo "$result" | jq -c '[.labels[]?.name] | sort'
+}
+
+# Add and/or remove individual labels. Adds are POSTs and are NEVER retried
+# (a repeat can duplicate the label entry) — instead the story is read first
+# and an already-present label is skipped. Removes go through the per-label
+# DELETE endpoint (idempotent, retried), which also works on the large,
+# heavily-commented stories that 500 on a full-story PUT.
 cmd_story_label() {
-  local project_id="${1:?Usage: lt story label <project_id> <story_id> --label \"...\"}"
-  local story_id="${2:?Usage: lt story label <project_id> <story_id> --label \"...\"}"
+  local usage='Usage: lt story label <project_id> <story_id> --label "<name>" [--label ...] [--remove "<name>" ...]'
+  local project_id="${1:?$usage}"
+  local story_id="${2:?$usage}"
   shift 2
-  local label=""
+  local -a adds=() removes=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --label) label="${2:?--label requires a value}"; shift 2 ;;
-      *)       die "Unknown flag: $1" ;;
+      --label)  adds+=("${2:?--label requires a value}"); shift 2 ;;
+      --remove) removes+=("${2:?--remove requires a value}"); shift 2 ;;
+      *)        die "Unknown flag: $1" ;;
     esac
   done
-  [[ -n "$label" ]] || die "--label is required"
+  [[ ${#adds[@]} -gt 0 || ${#removes[@]} -gt 0 ]] || die "Pass --label <name> to add and/or --remove <name> to remove (both repeatable)"
 
-  local json
-  json=$(jq -n --arg lbl "$label" '{label: {name: $lbl}}')
-  local result
-  result=$(api_post "/projects/$project_id/stories/$story_id/labels" "$json")
-  echo "Added label '$label' to story #$story_id"
+  local current
+  current=$(_story_labels_json "$project_id" "$story_id")
+
+  local lbl
+  for lbl in "${adds[@]}"; do
+    if echo "$current" | jq -e --arg n "$lbl" 'any(.[]; .name == $n)' >/dev/null; then
+      echo "Label '$lbl' already on story #$story_id — skipped (no duplicate POST)"
+      continue
+    fi
+    api_post "/projects/$project_id/stories/$story_id/labels" "$(jq -n --arg lbl "$lbl" '{label: {name: $lbl}}')" >/dev/null
+    echo "Added label '$lbl' to story #$story_id"
+  done
+
+  for lbl in "${removes[@]}"; do
+    local lid
+    lid=$(echo "$current" | jq -r --arg n "$lbl" '.[] | select(.name == $n) | .id' | head -1)
+    if [[ -z "$lid" ]]; then
+      echo "Label '$lbl' not on story #$story_id — nothing to remove"
+      continue
+    fi
+    api_delete "/projects/$project_id/stories/$story_id/labels/$lid" >/dev/null
+    echo "Removed label '$lbl' from story #$story_id"
+  done
+
+  echo "Labels now: $(_story_labels_verify "$project_id" "$story_id" | jq -r 'join(", ")')"
+}
+
+# Replace a story's ENTIRE label set. One idempotent PUT (retried on 5xx); the
+# large, heavily-commented stories 500 on a full-story PUT every time, so on
+# final failure this falls back to a per-label diff (POST adds, DELETE removes)
+# against the server's current set, then verifies with a fresh GET.
+cmd_story_labels() {
+  local usage='Usage: lt story labels <project_id> <story_id> --set "label1,label2,..."'
+  local project_id="${1:?$usage}"
+  local story_id="${2:?$usage}"
+  shift 2
+  local set_csv=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --set) set_csv="${2:?--set requires a comma-separated list}"; shift 2 ;;
+      *)     die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$set_csv" ]] || die "--set \"a,b,c\" is required — it REPLACES the whole label set, so include every label to keep"
+
+  local wanted
+  wanted=$(jq -cn --arg s "$set_csv" '[$s | split(",")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0)] | unique')
+  [[ "$(echo "$wanted" | jq 'length')" -gt 0 ]] || die "--set produced an empty label list"
+
+  local body
+  body=$(echo "$wanted" | jq -c '{labels: [.[] | {name: .}]}')
+
+  # `die` exits the shell it runs in; the ( ... ) subshell confines that exit so
+  # a failed PUT lands in the else-branch instead of killing the script
+  # (set -e is on).
+  local err_file; err_file=$(mktemp)
+  if ( api_put "/projects/$project_id/stories/$story_id" "$body" ) >/dev/null 2>"$err_file"; then
+    rm -f "$err_file"
+  else
+    echo "Warning: full-label PUT failed — $(tail -1 "$err_file"). Falling back to per-label add/remove." >&2
+    rm -f "$err_file"
+    local current
+    current=$(_story_labels_json "$project_id" "$story_id")
+    local to_add to_remove
+    to_add=$(jq -cn --argjson w "$wanted" --argjson c "$current" '[$w[] | select(. as $n | ($c | any(.[]; .name == $n)) | not)]')
+    to_remove=$(jq -cn --argjson w "$wanted" --argjson c "$current" '[$c[] | select(.name as $n | ($w | index($n)) == null)]')
+    local n
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      api_post "/projects/$project_id/stories/$story_id/labels" "$(jq -n --arg lbl "$n" '{label: {name: $lbl}}')" >/dev/null
+      echo "Added label '$n'"
+    done < <(echo "$to_add" | jq -r '.[]')
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      api_delete "/projects/$project_id/stories/$story_id/labels/$(echo "$line" | jq -r '.id')" >/dev/null
+      echo "Removed label '$(echo "$line" | jq -r '.name')'"
+    done < <(echo "$to_remove" | jq -c '.[]')
+  fi
+
+  local got want_sorted
+  got=$(_story_labels_verify "$project_id" "$story_id")
+  want_sorted=$(echo "$wanted" | jq -c 'sort')
+  if [[ "$got" == "$want_sorted" ]]; then
+    echo "Labels on story #$story_id set to: $(echo "$got" | jq -r 'join(", ")')"
+  else
+    die "Label set mismatch after write — wanted $want_sorted, server has $got"
+  fi
+}
+
+# Swap one label for another using only per-label add/remove: works on the
+# large stories that 500 on a full-story PUT, and cannot duplicate because it
+# checks presence first. Adds the new label BEFORE removing the old one, so a
+# failure mid-way leaves the story over-labelled rather than un-labelled.
+cmd_story_relabel() {
+  local usage='Usage: lt story relabel <project_id> <story_id> --from "<old>" --to "<new>"'
+  local project_id="${1:?$usage}"
+  local story_id="${2:?$usage}"
+  shift 2
+  local from="" to=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from="${2:?--from requires a value}"; shift 2 ;;
+      --to)   to="${2:?--to requires a value}"; shift 2 ;;
+      *)      die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$from" && -n "$to" ]] || die "--from <old-label> and --to <new-label> are both required"
+  [[ "$from" != "$to" ]] || die "--from and --to are the same label"
+
+  local current
+  current=$(_story_labels_json "$project_id" "$story_id")
+  if echo "$current" | jq -e --arg n "$to" 'any(.[]; .name == $n)' >/dev/null; then
+    echo "Story #$story_id already has '$to'"
+  else
+    api_post "/projects/$project_id/stories/$story_id/labels" "$(jq -n --arg lbl "$to" '{label: {name: $lbl}}')" >/dev/null
+    echo "Added label '$to'"
+  fi
+  local lid
+  lid=$(echo "$current" | jq -r --arg n "$from" '.[] | select(.name == $n) | .id' | head -1)
+  if [[ -z "$lid" ]]; then
+    echo "Story #$story_id does not have '$from' — nothing to remove"
+  else
+    api_delete "/projects/$project_id/stories/$story_id/labels/$lid" >/dev/null
+    echo "Removed label '$from'"
+  fi
+  echo "Labels now: $(_story_labels_verify "$project_id" "$story_id" | jq -r 'join(", ")')"
 }
 
 cmd_story_comments() {
@@ -699,7 +887,15 @@ cmd_story_comments() {
     echo "No comments on story #$story_id"
     return
   fi
-  echo "$data" | jq -r '.[] | "--- Comment #\(.id) at \(.created_at) ---\n\(.text)\n"'
+  # Resolve person_id -> name from the local people cache (best effort — falls
+  # back to "person <id>" when the cache is missing or the person isn't in it).
+  local names='{}'
+  local cached
+  if cached=$(cache_db "SELECT COALESCE(json_group_object(CAST(id AS TEXT), name), '{}') FROM people;" 2>/dev/null) && [[ -n "$cached" ]]; then
+    names="$cached"
+  fi
+  echo "$data" | jq -r --argjson names "$names" '
+    .[] | "--- Comment #\(.id) by \($names[(.person_id | tostring)] // ("person " + (.person_id | tostring))) at \(.created_at) ---\n\(.text)\n"'
 }
 
 cmd_story_comment() {
@@ -742,6 +938,7 @@ Available endpoints:
   stories.comments.list GET /projects/{project_id}/stories/{story_id}/comments
   stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments
   stories.labels.create POST /projects/{project_id}/stories/{story_id}/labels
+  stories.labels.delete DELETE /projects/{project_id}/stories/{story_id}/labels/{label_id}
 
 Example:
   lt schema stories.create
@@ -1004,6 +1201,23 @@ LIST
           }
         }
       }') ;;
+    stories.labels.delete)
+      schema=$(jq -n '{
+        description: "Removes one label from a story by the label id found on the story payload (labels[].id). Idempotent; the lt CLI retries it on 5xx. Works on large stories where a full-story PUT with a labels array returns 500.",
+        httpMethod: "DELETE",
+        path: "/projects/{project_id}/stories/{story_id}/labels/{label_id}",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          project_id: {type: "string", location: "path", required: true, description: "Project ID"},
+          story_id: {type: "string", location: "path", required: true, description: "Story ID"},
+          label_id: {type: "string", location: "path", required: true, description: "Label ID (from GET story -> labels[].id)"}
+        },
+        notes: [
+          "Used by `lt story label --remove`, `lt story labels --set` (fallback path) and `lt story relabel`.",
+          "To REPLACE a whole label set in one call, PUT the story with {labels: [{name}, ...]} — the array replaces the set. That PUT 500s on very large stories; fall back to per-label add/delete."
+        ]
+      }')
+      ;;
     stories.labels|stories.labels.create)
       schema=$(jq -n '{
         description: "Adds a label to a story.",
@@ -1887,8 +2101,10 @@ Commands:
   story show <project_id> <story_id>            Show story details
   story create <project_id> [flags]             Create a new story
   story update <project_id> <story_id> [flags]  Update a story
-  story label <project_id> <story_id> [flags]   Add a label to a story
-  story comments <project_id> <story_id>          List comments on a story
+  story label <project_id> <story_id> [flags]   Add (--label) / remove (--remove) labels, repeatable
+  story labels <project_id> <story_id> --set "a,b"  REPLACE the whole label set (PUT; per-label fallback)
+  story relabel <project_id> <story_id> --from X --to Y  Swap one label for another (no duplicates)
+  story comments <project_id> <story_id>          List comments on a story (with author)
   story comment <project_id> <story_id> [flags]   Add a comment
   schema [endpoint]                               Show API endpoint details
   cache sync <project_id>... [flags]            Sync project(s) into local SQLite cache
@@ -2057,9 +2273,11 @@ main() {
         create)  cmd_story_create "$@" ;;
         update)  cmd_story_update "$@" ;;
         label)   cmd_story_label "$@" ;;
+        labels)  cmd_story_labels "$@" ;;
+        relabel) cmd_story_relabel "$@" ;;
         comments) cmd_story_comments "$@" ;;
         comment)  cmd_story_comment "$@" ;;
-        *)        die "Unknown story action: $action. Use: show, create, update, label, comments, comment" ;;
+        *)        die "Unknown story action: $action. Use: show, create, update, label, labels, relabel, comments, comment" ;;
       esac
       ;;
     schema)   cmd_schema "$@" ;;
