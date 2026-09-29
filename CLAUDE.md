@@ -56,7 +56,7 @@ LiteTracker REST API v5 docs: https://help.litetracker.com/api/rest/v5.html
 ## Notifications
 
 - **`lt notifications [--unread] [--type comment|story] [--project ID] [--limit N|--all] [--full|--json]`** wraps the undocumented `GET /my/notifications` (found by probing Pivotal v5 paths). Observed: newest first, `limit` honored, `offset` silently ignored, ~10 days retained, no single-notification GET. Payload has no story title or performer name: comment rows carry `performer_id` + `context` (comment text) with an empty `message`; story rows carry a ready `message` ("X accepted this story") and a null `performer_id`. Titles come from the cache; missing stories are fetched per story and written through. A few rows have every reference null (deleted stories/comments). Filters are client-side, so the server `limit` is only sent when no filter is set.
-- **`lt notifications read --before <id> | --all`** → `PUT /my/notifications/mark_read {before}` (204). `PUT/PATCH /my/notifications/<id>` 404s. Only the `before=0` no-op has been verified; the id <= before semantics are assumed from Pivotal.
+- **`lt notifications read --before <id> | --through <id> | --all`** → `PUT /my/notifications/mark_read {before}` (204). `before` is EXCLUSIVE (verified: `before=460916` marked the older ones and left #460916 unread), so `--through`/`--all` send `id + 1`. `PUT/PATCH /my/notifications/<id>` 404s: a single notification can only be marked alone when it is the oldest unread.
 
 ## Label operations & write-retry policy
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -1004,25 +1004,28 @@ cmd_notifications() {
   ) | column -ts $'\t'
 }
 
-# PUT /my/notifications/mark_read {before: <id>} — Pivotal semantics: marks
-# every notification with id <= before as read. Only the no-op (before=0 → 204)
-# has been verified against LT.
+# PUT /my/notifications/mark_read {before: <id>} marks every notification with
+# id STRICTLY below `before` as read (verified: before=460916 left #460916
+# unread). There is no per-notification endpoint, so --through sends id+1.
 cmd_notifications_read() {
-  local before=""
+  local before="" through=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --before) before="${2:?--before requires a notification id}"; require_int "$before" "--before"; shift 2 ;;
-      --all)    before="all"; shift ;;
-      *)        die "Unknown flag: $1" ;;
+      --before)  before="${2:?--before requires a notification id}"; require_int "$before" "--before"; shift 2 ;;
+      --through) through="${2:?--through requires a notification id}"; require_int "$through" "--through"; shift 2 ;;
+      --all)     through="all"; shift ;;
+      *)         die "Unknown flag: $1" ;;
     esac
   done
-  [[ -n "$before" ]] || die "Usage: lt notifications read --before <notification_id> | --all"
-  if [[ "$before" == "all" ]]; then
-    before=$(api_get "/my/notifications?limit=1" | jq -r '.[0].id // empty')
-    [[ -n "$before" ]] || { echo "No notifications"; return; }
+  [[ -z "$before" || -z "$through" ]] || die "Use only one of --before, --through, --all"
+  [[ -n "$before$through" ]] || die "Usage: lt notifications read --before <id> | --through <id> | --all"
+  if [[ "$through" == "all" ]]; then
+    through=$(api_get "/my/notifications?limit=1" | jq -r '.[0].id // empty')
+    [[ -n "$through" ]] || { echo "No notifications"; return; }
   fi
+  [[ -n "$through" ]] && before=$((through + 1))
   api_put "/my/notifications/mark_read" "$(jq -n --argjson b "$before" '{before: $b}')" >/dev/null
-  echo "Marked notifications up to #$before as read"
+  echo "Marked notifications older than #$before as read"
 }
 
 cmd_schema() {
@@ -1125,12 +1128,12 @@ LIST
       }') ;;
     notifications.mark_read)
       schema=$(jq -n '{
-        description: "Marks every notification with id <= before as read (Pivotal semantics; only the before=0 no-op is verified). Returns 204.",
+        description: "Marks every notification with id < before (exclusive) as read. Returns 204. No per-notification endpoint exists.",
         httpMethod: "PUT",
         path: "/my/notifications/mark_read",
         auth: "X-TrackerToken header (required)",
         parameters: {
-          before: {type: "integer", location: "body", required: true, description: "Highest notification id to mark read"}
+          before: {type: "integer", location: "body", required: true, description: "Exclusive upper bound: ids below this are marked read"}
         }
       }') ;;
     memberships|memberships.list)
@@ -2254,7 +2257,7 @@ Commands:
   story comments <project_id> <story_id>          List comments on a story (with author)
   story comment <project_id> <story_id> [flags]   Add a comment
   notifications [flags]                         List your notifications (newest first)
-  notifications read --before <id> | --all      Mark notifications up to <id> (or all) as read
+  notifications read --before|--through <id> | --all  Mark read: ids < <id>, ids <= <id>, or everything
   schema [endpoint]                               Show API endpoint details
   cache sync <project_id>... [flags]            Sync project(s) into local SQLite cache
   cache reconcile <project_id> <id>... | [filters]  Refresh specific/filtered stories into the cache
