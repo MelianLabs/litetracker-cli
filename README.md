@@ -151,6 +151,26 @@ Known limitations (intentional for v1):
 - Sync is sequential (no parallel curl) — initial sync of a 4000-story project takes a few minutes.
 - `lt stories` (the live command) still hits the API; cache reads are explicit via `lt cache stories`.
 
+### Notifications
+
+```bash
+# Latest 20 notifications (story title resolved from the cache, fetched if missing)
+lt notifications
+
+# Unread comments only, full text
+lt notifications --unread --type comment --full
+
+# Everything LT still keeps (~10 days), or raw JSON for scripting
+lt notifications --all
+lt notifications --unread --json
+
+# Mark as read: everything up to a notification id, or all
+lt notifications read --before 469598
+lt notifications read --all
+```
+
+`/my/notifications` is undocumented: `limit` works, `offset` is ignored, and only ~10 days are kept. Mark-read uses `PUT /my/notifications/mark_read {before: <id>}` (Pivotal semantics).
+
 ### Schema
 
 Inspect any API endpoint to see its HTTP method, path, parameters, request body, and response shape:
