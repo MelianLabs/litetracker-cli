@@ -164,12 +164,13 @@ lt notifications --unread --type comment --full
 lt notifications --all
 lt notifications --unread --json
 
-# Mark as read: everything up to a notification id, or all
+# Mark as read: ids below 469598, 469598 and everything older, or all
 lt notifications read --before 469598
+lt notifications read --through 469598
 lt notifications read --all
 ```
 
-`/my/notifications` is undocumented: `limit` works, `offset` is ignored, and only ~10 days are kept. Mark-read uses `PUT /my/notifications/mark_read {before: <id>}` (Pivotal semantics).
+`/my/notifications` is undocumented: `limit` works, `offset` is ignored, and only ~10 days are kept. Mark-read uses `PUT /my/notifications/mark_read {before: <id>}`, which marks ids strictly below `before`. There is no way to mark one notification without marking every older one.
 
 ### Schema
 
