@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -918,6 +918,113 @@ cmd_story_comment() {
   echo "Comment added to story #$story_id"
 }
 
+# GET /my/notifications (undocumented, Pivotal-compatible). Observed behavior:
+# newest first, `limit` honored, `offset` ignored, only ~10 days retained, no
+# story title or performer name in the payload — titles/names are resolved from
+# the cache, and stories missing there are fetched (and written through).
+cmd_notifications() {
+  local limit=20 unread=0 type="" project="" full=0 as_json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --unread)  unread=1; shift ;;
+      --type)    type="${2:?--type requires a value}"; shift 2 ;;
+      --project) project="${2:?--project requires a value}"; require_int "$project" "--project"; shift 2 ;;
+      --limit)   limit="${2:?--limit requires a value}"; require_int "$limit" "--limit"; shift 2 ;;
+      --all)     limit=0; shift ;;
+      --full)    full=1; shift ;;
+      --json)    as_json=1; shift ;;
+      *)         die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -z "$type" || "$type" =~ ^(comment|story)$ ]] || die "--type: expected comment or story, got '$type'"
+
+  # Filters are client-side, so fetch everything whenever one is set and apply
+  # the limit after filtering.
+  local qs=""
+  [[ "$unread" -eq 0 && -z "$type" && -z "$project" && "$limit" -gt 0 ]] && qs="?limit=$limit"
+  local data
+  data=$(api_get "/my/notifications$qs" | jq -c \
+    --argjson unread "$unread" --arg type "$type" --arg project "$project" --argjson limit "$limit" '
+      map(select(($unread == 0 or .read_at == null)
+                 and ($type == "" or .notification_type == $type)
+                 and ($project == "" or (.project_id | tostring) == $project)))
+      | if $limit > 0 then .[0:$limit] else . end')
+
+  if [[ "$as_json" -eq 1 ]]; then
+    echo "$data" | jq .
+    return
+  fi
+  if [[ "$(echo "$data" | jq 'length')" -eq 0 ]]; then
+    echo "No notifications"
+    return
+  fi
+
+  local titles='{}' names='{}' cached
+  if [[ -f "$CACHE_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    local ids
+    ids=$(echo "$data" | jq -r '[.[].story_id | select(. != null)] | unique | join(",")')
+    if [[ -n "$ids" ]] && cached=$(cache_db "SELECT COALESCE(json_group_object(CAST(id AS TEXT), title), '{}') FROM stories WHERE id IN ($ids);" 2>/dev/null) && [[ -n "$cached" ]]; then
+      titles="$cached"
+    fi
+    if cached=$(cache_db "SELECT COALESCE(json_group_object(CAST(id AS TEXT), name), '{}') FROM people;" 2>/dev/null) && [[ -n "$cached" ]]; then
+      names="$cached"
+    fi
+  fi
+
+  local pid sid story
+  while IFS=$'\t' read -r pid sid; do
+    if story=$( (api_get "/projects/$pid/stories/$sid") 2>/dev/null ); then
+      cache_writethrough_story "$pid" "$story"
+      titles=$(jq -c --argjson s "$story" '. + {($s.id | tostring): $s.title}' <<<"$titles")
+    fi
+  done < <(echo "$data" | jq -r --argjson titles "$titles" '
+    [.[] | select(.story_id != null and ($titles[(.story_id | tostring)] == null))]
+    | unique_by(.story_id)[] | [(.project_id | tostring), (.story_id | tostring)] | @tsv')
+
+  # Story notifications carry a ready-made `message` ("X accepted this story");
+  # comment notifications leave it empty and put the comment text in `context`.
+  local describe='
+    def who: $names[(.performer_id // "" | tostring)] // (if .performer_id then "person \(.performer_id)" else "someone" end);
+    def title: $titles[(.story_id // "" | tostring)] // "";
+    def what: if (.message // "") != "" then .message else "\(who) \(.action)" end;'
+
+  if [[ "$full" -eq 1 ]]; then
+    echo "$data" | jq -r --argjson titles "$titles" --argjson names "$names" "$describe"'
+      .[] | "--- #\(.id) \(if .read_at then "read" else "UNREAD" end) \(.created_at) — story #\(.story_id) (project \(.project_id)) \(title) ---\n\(what)\(if .context then "\n\n" + .context else "" end)\n"'
+    return
+  fi
+
+  (
+    echo -e "ID\tWHEN\tREAD\tPROJECT\tSTORY\tTITLE\tWHAT"
+    echo "$data" | jq -r --argjson titles "$titles" --argjson names "$names" "$describe"'
+      def clip($n): if length > $n then .[0:$n - 1] + "…" else . end;
+      .[] | [(.id | tostring), .created_at, (if .read_at then "read" else "UNREAD" end),
+             (.project_id | tostring), (.story_id // "" | tostring), (title | clip(50)),
+             ((what + (if .context then ": " + .context else "" end)) | gsub("[\r\n\t]+"; " ") | clip(90))] | @tsv'
+  ) | column -ts $'\t'
+}
+
+# PUT /my/notifications/mark_read {before: <id>} — Pivotal semantics: marks
+# every notification with id <= before as read. Only the no-op (before=0 → 204)
+# has been verified against LT.
+cmd_notifications_read() {
+  local before=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --before) before="${2:?--before requires a notification id}"; require_int "$before" "--before"; shift 2 ;;
+      --all)    before="all"; shift ;;
+      *)        die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$before" ]] || die "Usage: lt notifications read --before <notification_id> | --all"
+  if [[ "$before" == "all" ]]; then
+    before=$(api_get "/my/notifications?limit=1" | jq -r '.[0].id // empty')
+    [[ -n "$before" ]] || { echo "No notifications"; return; }
+  fi
+  api_put "/my/notifications/mark_read" "$(jq -n --argjson b "$before" '{before: $b}')" >/dev/null
+  echo "Marked notifications up to #$before as read"
+}
+
 cmd_schema() {
   local path="${1:-}"
   if [[ -z "$path" ]]; then
@@ -939,6 +1046,8 @@ Available endpoints:
   stories.comments.create POST /projects/{project_id}/stories/{story_id}/comments
   stories.labels.create POST /projects/{project_id}/stories/{story_id}/labels
   stories.labels.delete DELETE /projects/{project_id}/stories/{story_id}/labels/{label_id}
+  notifications.list    GET /my/notifications
+  notifications.mark_read PUT /my/notifications/mark_read
 
 Example:
   lt schema stories.create
@@ -984,6 +1093,44 @@ LIST
               updated_at: {type: "string", description: "Last update timestamp"}
             }
           }
+        }
+      }') ;;
+    notifications|notifications.list)
+      schema=$(jq -n '{
+        description: "Lists the authenticated user'"'"'s notifications, newest first. Undocumented; ~10 days retained; offset is ignored.",
+        httpMethod: "GET",
+        path: "/my/notifications",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          limit: {type: "integer", location: "query", required: false, description: "Max rows returned"}
+        },
+        response: {
+          type: "array",
+          items: {
+            properties: {
+              id: {type: "integer", description: "Notification ID"},
+              project_id: {type: "integer", description: "Project ID"},
+              story_id: {type: "integer", description: "Story ID"},
+              comment_id: {type: "integer", description: "Comment ID (comment notifications)"},
+              performer_id: {type: "integer", description: "Person who acted (null on story notifications)"},
+              notification_type: {type: "string", description: "comment or story"},
+              action: {type: "string", description: "commented, reacted, started, finished, delivered, accepted, rejected, ..."},
+              message: {type: "string", description: "Human-readable summary (empty on comments)"},
+              context: {type: "string", description: "Comment text (comment notifications)"},
+              read_at: {type: "string", description: "null when unread"},
+              created_at: {type: "string", description: "e.g. \"29 Sep 2026, 05:49AM\""}
+            }
+          }
+        }
+      }') ;;
+    notifications.mark_read)
+      schema=$(jq -n '{
+        description: "Marks every notification with id <= before as read (Pivotal semantics; only the before=0 no-op is verified). Returns 204.",
+        httpMethod: "PUT",
+        path: "/my/notifications/mark_read",
+        auth: "X-TrackerToken header (required)",
+        parameters: {
+          before: {type: "integer", location: "body", required: true, description: "Highest notification id to mark read"}
         }
       }') ;;
     memberships|memberships.list)
@@ -2106,6 +2253,8 @@ Commands:
   story relabel <project_id> <story_id> --from X --to Y  Swap one label for another (no duplicates)
   story comments <project_id> <story_id>          List comments on a story (with author)
   story comment <project_id> <story_id> [flags]   Add a comment
+  notifications [flags]                         List your notifications (newest first)
+  notifications read --before <id> | --all      Mark notifications up to <id> (or all) as read
   schema [endpoint]                               Show API endpoint details
   cache sync <project_id>... [flags]            Sync project(s) into local SQLite cache
   cache reconcile <project_id> <id>... | [filters]  Refresh specific/filtered stories into the cache
@@ -2224,6 +2373,16 @@ Cache Reconcile (targeted "poor man's sync"):
   projects (e.g. 254). There, discover candidate ids from the cache
   ('lt cache stories 254 --label ...' style) and reconcile them BY ID instead.
 
+Notifications Flags:
+  --unread           Only unread notifications.
+  --type TYPE        comment or story.
+  --project ID       Only notifications from this project.
+  --limit N          Show at most N (default 20); --all shows everything.
+  --full             Full comment text instead of a one-line table.
+  --json             Raw API payload (after filtering).
+  LT keeps ~10 days of notifications and ignores offset, so there is no paging.
+  Story titles come from the cache; missing ones are fetched and cached.
+
 Cache Stories Flags:
   --active               State IN (unstarted, planned, started, finished,
                          delivered, rejected) — mirrors the sync default.
@@ -2264,6 +2423,10 @@ main() {
     projects) load_token; cmd_projects "$@" ;;
     members)  load_token; cmd_members "$@" ;;
     stories)  load_token; cmd_stories "$@" ;;
+    notifications)
+      load_token
+      if [[ "${1:-}" == "read" ]]; then shift; cmd_notifications_read "$@"; else cmd_notifications "$@"; fi
+      ;;
     story)
       load_token
       local action="${1:-help}"
