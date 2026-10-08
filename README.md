@@ -89,6 +89,14 @@ lt story create <project_id> --name "Fix bug" --type bug --label "backend" --own
 # Update a story
 lt story update <project_id> <story_id> --state "started" --estimate 3 --owner-ids 42,55
 
+# Pull a story into the bottom of the Current panel (state planned); opt-in, also on create.
+# The API can't reorder within a panel, so "top of backlog" is UI-only.
+lt story update <project_id> <story_id> --current
+lt story create <project_id> --name "Hotfix" --type bug --current
+
+# Delete a story (LT has no DELETE endpoint; this sets state to deleted)
+lt story delete <project_id> <story_id> --yes
+
 # Add a label to a story
 lt story label <project_id> <story_id> --label "urgent"
 
