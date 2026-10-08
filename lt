@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.5.1"
+VERSION="0.6.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -627,7 +627,7 @@ cmd_story_show() {
 cmd_story_create() {
   local project_id="${1:?Usage: lt story create <project_id> --name \"...\"}"
   shift
-  local name="" story_type="feature" estimate="" description="" owner_ids="" state="unstarted"
+  local name="" story_type="feature" estimate="" description="" owner_ids="" state="unstarted" state_set=0 current=0
   local -a labels=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -637,11 +637,16 @@ cmd_story_create() {
       --label)       labels+=("${2:?--label requires a value}"); shift 2 ;;
       --description) description="${2:?--description requires a value}"; shift 2 ;;
       --owner-ids)   owner_ids="${2:?--owner-ids requires a value}"; shift 2 ;;
-      --state)       state="${2:?--state requires a value}"; shift 2 ;;
+      --state)       state="${2:?--state requires a value}"; state_set=1; shift 2 ;;
+      --current)     current=1; shift ;;
       *)             die "Unknown flag: $1" ;;
     esac
   done
   [[ -n "$name" ]] || die "--name is required"
+  if [[ "$current" -eq 1 ]]; then
+    [[ "$state_set" -eq 0 ]] || die "--current and --state are mutually exclusive (--current means --state planned)"
+    state="planned"
+  fi
 
   # Default to unstarted (backlog) — the API's own default is unscheduled,
   # which buries new stories at the bottom of the icebox. Verified the API
@@ -689,16 +694,22 @@ cmd_story_update() {
   local project_id="${1:?Usage: lt story update <project_id> <story_id> [flags]}"
   local story_id="${2:?Usage: lt story update <project_id> <story_id> [flags]}"
   shift 2
-  local state="" estimate="" owner_ids=""
+  local state="" estimate="" owner_ids="" current=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --state)      state="${2:?--state requires a value}"; shift 2 ;;
+      --current)    current=1; shift ;;
       --estimate)   estimate="${2:?--estimate requires a value}"; shift 2 ;;
       --owner-ids)  owner_ids="${2:?--owner-ids requires a value}"; shift 2 ;;
       *)            die "Unknown flag: $1" ;;
     esac
   done
-  [[ -n "$state" || -n "$estimate" || -n "$owner_ids" ]] || die "At least one of --state, --estimate, or --owner-ids is required"
+  if [[ "$current" -eq 1 ]]; then
+    [[ -z "$state" ]] || die "--current and --state are mutually exclusive (--current means --state planned)"
+    state="planned"
+  fi
+  [[ "$state" != "deleted" ]] || die "Use 'lt story delete <project_id> <story_id> --yes' to delete a story"
+  [[ -n "$state" || -n "$estimate" || -n "$owner_ids" ]] || die "At least one of --state, --current, --estimate, or --owner-ids is required"
 
   local json
   json=$(jq -n '{}')
@@ -711,6 +722,29 @@ cmd_story_update() {
   cache_writethrough_story "$project_id" "$result"
   echo "Updated story #$story_id"
   echo "$result" | jq '{id, title, story_type, current_state, estimate, owner_ids: [.owners[]?.user_id], url}'
+}
+
+# LT has no DELETE endpoint for stories (DELETE /stories/<id> 404s); setting
+# current_state to "deleted" is how the web UI deletes one.
+cmd_story_delete() {
+  local usage='Usage: lt story delete <project_id> <story_id> --yes'
+  local project_id="${1:?$usage}"
+  local story_id="${2:?$usage}"
+  shift 2
+  local yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *)     die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ "$yes" -eq 1 ]] || die "Deleting story #$story_id needs --yes ($usage)"
+
+  local result
+  result=$(api_put "/projects/$project_id/stories/$story_id" '{"current_state":"deleted"}')
+  cache_writethrough_story "$project_id" "$result"
+  echo "Deleted story #$story_id"
+  echo "$result" | jq '{id, title, current_state, url}'
 }
 
 # Current labels of a story as compact JSON [{id, name}, ...] — one GET.
@@ -1251,7 +1285,7 @@ LIST
             description: {type: "string", required: false, description: "Story description"},
             labels: {type: "array", required: false, description: "Array of label objects, e.g. [{\"name\": \"urgent\"}]"},
             owner_ids: {type: "array", required: false, description: "CLI-only convenience (--owner-ids). The API ignores owners on create, so the CLI assigns them via a follow-up update — not a real create-endpoint field."},
-            current_state: {type: "string", required: false, description: "Initial state: unscheduled (icebox) or unstarted (backlog). Accepted on create, even for unestimated features."}
+            current_state: {type: "string", required: false, description: "Initial state: unscheduled (icebox), unstarted (backlog) or planned (bottom of Current). Accepted on create, even for unestimated features."}
           }
         },
         notes: [
@@ -1281,7 +1315,7 @@ LIST
         },
         requestBody: {
           properties: {
-            current_state: {type: "string", required: false, description: "State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted"},
+            current_state: {type: "string", required: false, description: "State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted, deleted"},
             estimate: {type: "integer", required: false, description: "Point estimate"},
             owner_ids: {type: "array", required: false, description: "Array of user IDs to assign as owners"}
           }
@@ -1289,7 +1323,10 @@ LIST
         notes: [
           "State transitions follow AASM rules (e.g., cannot accept a story that has not been delivered)",
           "For chores and releases, finish automatically maps to accept",
-          "Feature/bug stories require an estimate before starting (unless chores/releases)"
+          "Feature/bug stories require an estimate before starting (unless chores/releases)",
+          "planned puts the story at the BOTTOM of the Current panel (lt story update --current)",
+          "deleted deletes the story (lt story delete); DELETE /stories/{id} is not supported (404)",
+          "Ordering cannot be changed: before_id/after_id/position return 500, and are silently ignored on create"
         ],
         response: {
           properties: {
@@ -2251,6 +2288,7 @@ Commands:
   story show <project_id> <story_id>            Show story details
   story create <project_id> [flags]             Create a new story
   story update <project_id> <story_id> [flags]  Update a story
+  story delete <project_id> <story_id> --yes    Delete a story (sets state to deleted)
   story label <project_id> <story_id> [flags]   Add (--label) / remove (--remove) labels, repeatable
   story labels <project_id> <story_id> --set "a,b"  REPLACE the whole label set (PUT; per-label fallback)
   story relabel <project_id> <story_id> --from X --to Y  Swap one label for another (no duplicates)
@@ -2300,9 +2338,14 @@ Story Create Flags:
                        update automatically.
   --state STATE        Initial state (default: unstarted = backlog; use
                        unscheduled to file into the icebox)
+  --current            File at the BOTTOM of the Current panel (state
+                       planned). Opt-in; excludes --state.
 
 Story Update Flags:
   --state STATE      State: unscheduled, unstarted, planned, started, finished, delivered, rejected, accepted
+  --current          Move to the BOTTOM of the Current panel (state planned).
+                     Opt-in; excludes --state. The API cannot reorder within a
+                     panel (before_id/after_id 500), so top-of-backlog is UI-only.
   --estimate N       Point estimate
   --owner-ids N,...  Comma-separated user IDs
 
@@ -2438,12 +2481,13 @@ main() {
         show)    cmd_story_show "$@" ;;
         create)  cmd_story_create "$@" ;;
         update)  cmd_story_update "$@" ;;
+        delete)  cmd_story_delete "$@" ;;
         label)   cmd_story_label "$@" ;;
         labels)  cmd_story_labels "$@" ;;
         relabel) cmd_story_relabel "$@" ;;
         comments) cmd_story_comments "$@" ;;
         comment)  cmd_story_comment "$@" ;;
-        *)        die "Unknown story action: $action. Use: show, create, update, label, labels, relabel, comments, comment" ;;
+        *)        die "Unknown story action: $action. Use: show, create, update, delete, label, labels, relabel, comments, comment" ;;
       esac
       ;;
     schema)   cmd_schema "$@" ;;
