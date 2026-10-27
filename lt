@@ -597,7 +597,7 @@ cmd_stories() {
 
   # Truncation note: only meaningful for an unpaged, unfiltered, user-limited
   # call (fetch_stories_list applies STORIES_PAGE_SIZE otherwise).
-  if [[ "$fetch_all" -eq 0 && "$active" -eq 0 && -z "$server_clause" && -n "$limit" && "$total" -eq "$limit" ]]; then
+  if [[ "$fetch_all" -eq 0 && "$active" -eq 0 && -z "$server_filter" && -n "$limit" && "$total" -eq "$limit" ]]; then
     echo >&2
     echo "Note: returned exactly $limit rows — more may exist. Re-run with --all to fetch every page." >&2
   fi
