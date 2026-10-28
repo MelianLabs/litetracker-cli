@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -627,7 +627,7 @@ cmd_story_show() {
 cmd_story_create() {
   local project_id="${1:?Usage: lt story create <project_id> --name \"...\"}"
   shift
-  local name="" story_type="feature" estimate="" description="" owner_ids="" state="unstarted" state_set=0 current=0
+  local name="" story_type="feature" estimate="" description="" owner_ids="" state="unscheduled" state_set=0 current=0
   local -a labels=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -648,9 +648,9 @@ cmd_story_create() {
     state="planned"
   fi
 
-  # Default to unstarted (backlog) — the API's own default is unscheduled,
-  # which buries new stories at the bottom of the icebox. Verified the API
-  # accepts current_state on create, even for unestimated features.
+  # Default to unscheduled (icebox), the API's own default: stories filed by
+  # scripts and agents should not land straight in the backlog. Sent
+  # explicitly so the placement never depends on the server default.
   local json
   json=$(jq -n --arg name "$name" --arg type "$story_type" --arg state "$state" '{name: $name, story_type: $type, current_state: $state}')
   [[ -n "$estimate" ]] && json=$(echo "$json" | jq --argjson est "$estimate" '. + {estimate: $est}')
@@ -1290,7 +1290,7 @@ LIST
         },
         notes: [
           "The API itself ignores owner_ids on create. The lt CLI accepts --owner-ids and fires a follow-up story update to assign owners; a direct API call must use story update.",
-          "The API defaults current_state to unscheduled (bottom of the icebox). The lt CLI sends unstarted (backlog) by default so new stories stay visible; pass --state unscheduled to file into the icebox."
+          "The API defaults current_state to unscheduled (bottom of the icebox). The lt CLI sends unscheduled (icebox) by default; pass --state unstarted to file into the backlog or --current for the bottom of Current."
         ],
         response: {
           properties: {
@@ -2336,8 +2336,8 @@ Story Create Flags:
   --owner-ids N,...    Comma-separated user IDs to assign as owners. The API
                        ignores owners on create, so this fires a follow-up
                        update automatically.
-  --state STATE        Initial state (default: unstarted = backlog; use
-                       unscheduled to file into the icebox)
+  --state STATE        Initial state (default: unscheduled = icebox; use
+                       unstarted to file into the backlog)
   --current            File at the BOTTOM of the Current panel (state
                        planned). Opt-in; excludes --state.
 
