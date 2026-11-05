@@ -223,7 +223,7 @@ lt story comment 123456 789012 --text "Root cause found - session cookie not set
 
 ## Story Types
 
-**Types:** `feature`, `bug`, `chore`
+**Types:** `feature`, `bug`. `lt story create` refuses `chore` and `release` before calling the API; file maintenance or technical-debt work as a `feature` with the label `technical debt`.
 
 ## AI Agent Integration
 
