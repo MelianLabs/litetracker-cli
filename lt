@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.7.1"
 BASE_URL="https://app.litetracker.com/services/v5"
 CONFIG_DIR="$HOME/.lt"
 TOKEN_FILE="$CONFIG_DIR/api_token"
@@ -643,6 +643,7 @@ cmd_story_create() {
     esac
   done
   [[ -n "$name" ]] || die "--name is required"
+  [[ "$story_type" =~ ^(feature|bug)$ ]] || die "--type: '$story_type' is not allowed. Stories are feature or bug only; for maintenance or technical debt use --type feature --label \"technical debt\""
   if [[ "$current" -eq 1 ]]; then
     [[ "$state_set" -eq 0 ]] || die "--current and --state are mutually exclusive (--current means --state planned)"
     state="planned"
@@ -1280,7 +1281,7 @@ LIST
         requestBody: {
           properties: {
             name: {type: "string", required: true, description: "Story title (required)"},
-            story_type: {type: "string", required: false, description: "Type: feature (default), bug, or chore"},
+            story_type: {type: "string", required: false, description: "Type: feature (default) or bug; chore and release are refused"},
             estimate: {type: "integer", required: false, description: "Point estimate"},
             description: {type: "string", required: false, description: "Story description"},
             labels: {type: "array", required: false, description: "Array of label objects, e.g. [{\"name\": \"urgent\"}]"},
@@ -2329,7 +2330,7 @@ Stories List Flags:
 
 Story Create Flags:
   --name "..."         Story name (required)
-  --type TYPE          feature, bug, or chore (default: feature)
+  --type TYPE          feature or bug (default: feature); chore and release are refused
   --estimate N         Point estimate
   --label "..."        Add a label
   --description "..."  Story description
